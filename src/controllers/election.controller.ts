@@ -236,37 +236,32 @@ export const toggleLockdown = asyncHandler(async (req: Request, res: Response) =
 
 export const registerForElection = asyncHandler(async (req: Request, res: Response) => {
   const { electionCode } = req.body as { electionCode: string };
-
+ 
+  // Ensure user has completed their profile
   if (!req.user.profileCompleted) {
     throw new AppError(400, 'Complete your profile before registering for elections');
   }
-
+ 
+  // Ensure user has a matric number
+  if (!req.user.matricNumber) {
+    throw new AppError(400, 'Your profile must include a matric number to register for elections');
+  }
+ 
+  // Find the election
   const election = await Election.findOne({ electionCode: electionCode.toUpperCase() });
   if (!election) throw new AppError(404, 'Election not found');
-  if (election.status !== 'registration_open') throw new AppError(400, 'Registration is not open for this election');
+  if (election.status !== 'registration_open') 
+    throw new AppError(400, 'Registration is not open for this election');
   if (election.isLocked) throw new AppError(423, 'Election is in lockdown');
-
-  // Check eligibility first (separate from the registration write — eligibility
-  // data is read-only during registration so there is no race condition here).
-  const orConditions: Array<Record<string, unknown>> = [{ email: req.user.email }];
-  if (req.user.matricNumber) {
-    orConditions.push({ matricNumber: req.user.matricNumber });
-  }
+ 
+  // Check eligibility using matric number
   const eligible = await AssociationMember.findOne({
-    electionId: election._id,
-    $or:        orConditions,
+    electionId:   election._id,
+    matricNumber: req.user.matricNumber,
   });
   if (!eligible) throw new AppError(403, 'You are not on the eligibility list for this election');
-
-  // FIX (Issue 4): Replace the non-atomic findOne → create pattern with a single
-  // findOneAndUpdate upsert. The old code had a TOCTOU window: two concurrent
-  // requests could both pass the findOne check before either create completed,
-  // resulting in two RegisteredVoter documents for the same voter.
-  //
-  // $setOnInsert only writes when the document is newly created (upsert), so
-  // an existing document is never modified. new:false returns the document that
-  // existed BEFORE the operation — null means it was just inserted (success),
-  // a non-null value means the document already existed (duplicate).
+ 
+  // Register user as a voter (upsert - create if not exists)
   const existingVoter = await RegisteredVoter.findOneAndUpdate(
     { electionId: election._id, userId: req.user._id },
     {
@@ -278,19 +273,21 @@ export const registerForElection = asyncHandler(async (req: Request, res: Respon
     },
     { upsert: true, new: false }
   );
-
+ 
+  // If existingVoter is not null, the user was already registered
   if (existingVoter !== null) {
     throw new AppError(409, 'You are already registered for this election');
   }
-
+ 
+  // Log the registration action
   await logAction({
     action:      AUDIT_ACTIONS.VOTER_REGISTERED,
     performedBy: req.user._id,
     targetId:    election._id,
     targetModel: 'RegisteredVoter',
-    metadata:    { electionId: election._id.toString() },
+    metadata:    { electionId: election._id.toString(), matricNumber: req.user.matricNumber },
   });
-
+ 
   sendSuccess(res, null, 'Successfully registered for election', 201);
 });
 
@@ -427,28 +424,6 @@ export const listMyElections = asyncHandler(async (req: Request, res: Response) 
   sendSuccess(res, elections);
 });
 
-// ── Delete election ───────────────────────────────────────────────────────────
-
-/**
- * DELETE /api/elections/:id  (SA only)
- *
- * Safety rules:
- *   - Only `draft` elections can be deleted without a confirmation flag.
- *   - Elections in any other deletable status require { force: true } in the
- *     request body — this protects against accidental deletion of elections
- *     that already have members, candidates, or votes.
- *   - `results_published` elections are permanently blocked from deletion;
- *     they form part of the historical record.
- *
- * Cascade order (mirrors the data dependency graph):
- *   1. Votes
- *   2. Registered voters
- *   3. Candidate Cloudinary photos  (best-effort, non-fatal)
- *   4. Candidate documents
- *   5. Office documents
- *   6. Association member list
- *   7. Election document
- */
 export const deleteElection = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');

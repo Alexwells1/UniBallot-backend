@@ -44,12 +44,9 @@ export const listMembers = asyncHandler(async (req: Request, res: Response) => {
   const filter: Record<string, unknown> = { electionId: req.params.id };
 
   if (search) {
-    // FIX (Issue 5): Escape metacharacters to prevent ReDoS via crafted search strings.
+    // Escape metacharacters to prevent ReDoS via crafted search strings
     const escaped = search.slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    filter.$or = [
-      { email:        { $regex: escaped, $options: 'i' } },
-      { matricNumber: { $regex: escaped, $options: 'i' } },
-    ];
+    filter.matricNumber = { $regex: escaped, $options: 'i' };
   }
 
   const [members, total] = await Promise.all([
@@ -74,10 +71,7 @@ export const getMember = asyncHandler(async (req: Request, res: Response) => {
 // ─── Update ────────────────────────────────────────────────────────────────────
 
 const updateMemberSchema = z.object({
-  email:        z.string().email().optional(),
-  matricNumber: z.string().regex(MATRIC_NUMBER_REGEX, 'Invalid matric number format').optional(),
-}).refine(d => d.email || d.matricNumber, {
-  message: 'Provide at least one field to update',
+  matricNumber: z.string().regex(MATRIC_NUMBER_REGEX, 'Invalid matric number format'),
 });
 
 export const updateMember = asyncHandler(async (req: Request, res: Response) => {
@@ -91,30 +85,18 @@ export const updateMember = asyncHandler(async (req: Request, res: Response) => 
   if (!parsed.success)
     throw new AppError(400, parsed.error.errors[0].message);
 
-  const { email, matricNumber } = parsed.data;
+  const { matricNumber } = parsed.data;
 
-  // Check uniqueness within the same election (excluding this member)
-  if (email) {
-    const conflict = await AssociationMember.findOne({
-      electionId: req.params.id,
-      email:      email.toLowerCase().trim(),
-      _id:        { $ne: req.params.memberId },
-    });
-    if (conflict) throw new AppError(409, 'Email already exists in this election');
-  }
-
-  if (matricNumber) {
-    const conflict = await AssociationMember.findOne({
-      electionId:   req.params.id,
-      matricNumber: matricNumber.trim(),
-      _id:          { $ne: req.params.memberId },
-    });
-    if (conflict) throw new AppError(409, 'Matric number already exists in this election');
-  }
+  // Check uniqueness within the same election
+  const conflict = await AssociationMember.findOne({
+    electionId:   req.params.id,
+    matricNumber: matricNumber.trim(),
+    _id:          { $ne: req.params.memberId },
+  });
+  if (conflict) throw new AppError(409, 'Matric number already exists in this election');
 
   const update: Record<string, string> = {};
-  if (email)        update.email        = email.toLowerCase().trim();
-  if (matricNumber) update.matricNumber = matricNumber.trim();
+  update.matricNumber = matricNumber.trim();
 
   const member = await AssociationMember.findOneAndUpdate(
     { _id: req.params.memberId, electionId: req.params.id },
@@ -154,7 +136,7 @@ export const deleteMember = asyncHandler(async (req: Request, res: Response) => 
     performedBy: req.user._id,
     targetId:    member._id,
     targetModel: 'AssociationMember',
-    metadata:    { email: member.email, matricNumber: member.matricNumber },
+    metadata:    { matricNumber: member.matricNumber },
   });
 
   sendSuccess(res, null, 'Member deleted');
