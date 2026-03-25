@@ -16,30 +16,39 @@ async function bootstrap(): Promise<void> {
     app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT} [${env.NODE_ENV}]`);
 
-      const SELF_URL = `https://uniballot-backend.onrender.com/health`; 
       let pinging = false;
-      let pingInterval: ReturnType<typeof setInterval>;
+      let internalPingInterval: ReturnType<typeof setInterval>;
+      let externalPingInterval: ReturnType<typeof setInterval>;
 
       function startSelfPing() {
         if (pinging) return;
         pinging = true;
         console.log('✅ Self-ping started');
 
-        async function ping() {
+        const INTERNAL_URL = `http://127.0.0.1:${PORT}/health`;  // reliable internal ping
+        const EXTERNAL_URL = `https://uniballot-backend.onrender.com/health`; // public URL ping
+
+        async function ping(url: string) {
           try {
-            const res = await fetch(SELF_URL);
-            console.log(`[${new Date().toISOString()}] Self-ping status:`, res.status);
+            const res = await fetch(url);
+            console.log(`[${new Date().toISOString()}] Self-ping (${url}) status:`, res.status);
           } catch (err) {
-            console.error(`[${new Date().toISOString()}] Self-ping error:`, err);
+            console.error(`[${new Date().toISOString()}] Self-ping (${url}) error:`, err);
           }
         }
 
-        ping();
-        pingInterval = setInterval(ping, 180000);
+        // Internal ping every 3 minutes
+        ping(INTERNAL_URL);
+        internalPingInterval = setInterval(() => ping(INTERNAL_URL), 180000);
 
+        // External ping every 15 minutes
+        externalPingInterval = setInterval(() => ping(EXTERNAL_URL), 900000);
+
+        // Stop intervals on SIGTERM
         process.on('SIGTERM', () => {
           console.log('SIGTERM received — stopping self-ping');
-          if (pingInterval) clearInterval(pingInterval);
+          if (internalPingInterval) clearInterval(internalPingInterval);
+          if (externalPingInterval) clearInterval(externalPingInterval);
         });
       }
 
