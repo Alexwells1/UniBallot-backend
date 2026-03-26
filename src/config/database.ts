@@ -17,10 +17,6 @@ export async function createIndexes(): Promise<void> {
   if (!db) return;
 
   try {
-    // AssociationMember compound indexes
-    await db.collection('associationmembers').createIndex(
-      { electionId: 1, email: 1 },         { unique: true, background: true }
-    );
     await db.collection('associationmembers').createIndex(
       { electionId: 1, matricNumber: 1 },   { unique: true, background: true }
     );

@@ -4,18 +4,6 @@ import Election from '../models/Election';
 import Office from '../models/Office';
 import { AppError } from '../utils/AppError';
 
-/**
- * Authorises Super Admin OR the officer assigned to the election.
- *
- * Resolves the electionId from (in order):
- *   1. req.params.id          – standard election routes  (/elections/:id/…)
- *   2. req.params.electionId  – explicit named param
- *   3. req.params.officeId    – candidate routes (/offices/:officeId/candidates)
- *                               → looks up the Office document to find its electionId
- *
- * Officers are blocked when election.isLocked === true (SA is exempt).
- * Attaches the resolved election to req.election for downstream use.
- */
 export async function authorizeElection(
   req: Request,
   _res: Response,
