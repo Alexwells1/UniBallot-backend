@@ -14,33 +14,38 @@ import { AUDIT_ACTIONS } from '../config/constants';
 
 // ── Zod schemas ───────────────────────────────────────────────────────────────
 
+const funaabStudentEmail = z
+  .string()
+  .regex(
+    /^[a-zA-Z0-9._%+-]+@student\.funaab\.edu\.ng$/,
+    'Only FUNAAB student emails are allowed (e.g. john.doe@student.funaab.edu.ng)'
+  );
+
 export const registerSchema = z.object({
-  email:    z.string().email(),
+  email:    funaabStudentEmail,
   password: z.string().min(8, 'Password must be at least 8 characters'),
 });
 
 export const verifyOtpSchema = z.object({
-  email: z.string().email(),
+  email: funaabStudentEmail,
   otp:   z.string().length(6, 'OTP must be 6 digits'),
 });
 
 export const loginSchema = z.object({
-  email:    z.string().email(),
+  email:    funaabStudentEmail,
   password: z.string().min(1, 'Password is required'),
 });
 
-// Issue #4 — Zod schema for resendOtp (was missing)
 export const resendOtpSchema = z.object({
-  email: z.string().email(),
+  email: funaabStudentEmail,
 });
 
 export const refreshSchema = z.object({
   refreshToken: z.string().min(1, 'Refresh token is required'),
 });
 
-// Issue #8 — Zod schema for otp-status endpoint
 export const otpStatusSchema = z.object({
-  email: z.string().email(),
+  email: funaabStudentEmail,
 });
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
