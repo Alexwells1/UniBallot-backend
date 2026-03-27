@@ -32,7 +32,7 @@ export const verifyOtpSchema = z.object({
 });
 
 export const loginSchema = z.object({
-  email:    funaabStudentEmail,
+  email: z.string().email(),
   password: z.string().min(1, 'Password is required'),
 });
 
@@ -44,19 +44,14 @@ export const refreshSchema = z.object({
   refreshToken: z.string().min(1, 'Refresh token is required'),
 });
 
+// Issue #8 — Zod schema for otp-status endpoint
 export const otpStatusSchema = z.object({
-  email: funaabStudentEmail,
+    email:    funaabStudentEmail,
 });
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/**
- * Stage 1 – Accept email + password, send OTP.
- *
- * Issue #5 fix: if a valid unexpired record already exists for this email,
- * we do NOT generate a new OTP. We return a 409 telling the client to use
- * the resend endpoint instead.
- */
+
 export const register = asyncHandler(async (req: Request, res: Response) => {
   const { email, password } = req.body as z.infer<typeof registerSchema>;
   const normalised = email.toLowerCase();
@@ -68,7 +63,6 @@ export const register = asyncHandler(async (req: Request, res: Response) => {
 
   const result = await otpService.createOtpRecord(normalised, passwordHash);
 
-  // Existing valid record — do not spam a second email
   if (result.reused) {
     throw new AppError(
       409,
@@ -83,12 +77,6 @@ export const register = asyncHandler(async (req: Request, res: Response) => {
   sendSuccess(res, null, 'Check your email for a verification code', 201);
 });
 
-/**
- * Resend OTP.
- *
- * Issue #4 fix: now validated with Zod.
- * Issue #6 fix: catches typed AppError codes instead of string-matching.
- */
 export const resendOtp = asyncHandler(async (req: Request, res: Response) => {
   const { email } = req.body as z.infer<typeof resendOtpSchema>;
   const normalised = email.toLowerCase();
@@ -102,8 +90,6 @@ export const resendOtp = asyncHandler(async (req: Request, res: Response) => {
     );
   }
 
-  // AppError is thrown directly from the service with a typed code —
-  // no string matching needed here. Let it bubble to the error handler.
   const newOtp = await otpService.resendOtp(normalised);
 
   const template = emailService.otpEmailTemplate(newOtp);
@@ -116,10 +102,7 @@ export const resendOtp = asyncHandler(async (req: Request, res: Response) => {
   sendSuccess(res, null, 'A new verification code has been sent to your email', 200);
 });
 
-/**
- * GET /auth/otp-status — Issue #8.
- * Returns live resend eligibility and countdown for frontend timers.
- */
+
 export const otpStatus = asyncHandler(async (req: Request, res: Response) => {
   const { email } = req.query as z.infer<typeof otpStatusSchema>;
   const normalised = email.toLowerCase();
@@ -128,12 +111,7 @@ export const otpStatus = asyncHandler(async (req: Request, res: Response) => {
   sendSuccess(res, status, 'OTP status retrieved');
 });
 
-/**
- * Stage 2 – Verify OTP → create User → return token pair.
- *
- * Issue #3/#7 fix: checks locked flag and gives a clear message before
- * attempting bcrypt — record is no longer silently deleted mid-flow.
- */
+
 export const verifyOtp = asyncHandler(async (req: Request, res: Response) => {
   const { email, otp } = req.body as z.infer<typeof verifyOtpSchema>;
   const normalised = email.toLowerCase();
