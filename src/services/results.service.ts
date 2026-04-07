@@ -1,7 +1,9 @@
+
 import type { Types } from 'mongoose';
 import Office from '../models/Office';
 import Candidate from '../models/Candidate';
 import Vote from '../models/Vote';
+import { redis } from '../config/redis';
 
 export interface CandidateTally {
   candidateId: string;
@@ -10,35 +12,53 @@ export interface CandidateTally {
 }
 
 export interface OfficeTally {
-  officeId:     string;
-  officeTitle:  string;
-  voteType:     'competitive' | 'confirmation';
-  totalVotes:   number;
-  noVotes:      boolean;   // FIX (Issue 10): explicit flag instead of silently skipping
-  isTie:        boolean;
-  winner?:      string | null;
-  elected?:     boolean | null;
+  officeId:      string;
+  officeTitle:   string;
+  voteType:      'competitive' | 'confirmation';
+  totalVotes:    number;
+  noVotes:       boolean;
+  isTie:         boolean;
+  winner?:       string | null;
+  elected?:      boolean | null;
   approveCount?: number;
   rejectCount?:  number;
-  candidates:   CandidateTally[];
+  candidates:    CandidateTally[];
 }
 
 export async function computeTally(
   electionId: string | Types.ObjectId
 ): Promise<OfficeTally[]> {
+
+  // Fetch offices first, then batch-load candidates and votes in parallel
   const offices = await Office.find({ electionId });
+  const officeIds = offices.map((o) => o._id);
+
+  const [allCandidates, allVotes] = await Promise.all([
+    Candidate.find({ officeId: { $in: officeIds } }),
+    Vote.find({ electionId }).select('officeId candidateId confirmationChoice').lean(),
+  ]);
+
+  // Group candidates and votes by officeId for O(1) lookup
+  const candidatesByOffice = new Map<string, typeof allCandidates>();
+  for (const c of allCandidates) {
+    const key = c.officeId.toString();
+    if (!candidatesByOffice.has(key)) candidatesByOffice.set(key, []);
+    candidatesByOffice.get(key)!.push(c);
+  }
+
+  const votesByOffice = new Map<string, typeof allVotes>();
+  for (const v of allVotes) {
+    const key = v.officeId.toString();
+    if (!votesByOffice.has(key)) votesByOffice.set(key, []);
+    votesByOffice.get(key)!.push(v);
+  }
 
   const tallies: OfficeTally[] = [];
 
   for (const office of offices) {
-    const candidates = await Candidate.find({ officeId: office._id });
-    const votes      = await Vote.find({ electionId, officeId: office._id });
+    const candidates = candidatesByOffice.get(office._id.toString()) ?? [];
+    const votes      = votesByOffice.get(office._id.toString())      ?? [];
 
-    // FIX (Issue 10): Never silently skip an office. If there are zero votes we
-    // still emit a tally row with noVotes:true so the published result set always
-    // has exactly one entry per office. Skipping would make results look complete
-    // when they are not — especially dangerous for single-candidate confirmation
-    // offices where low turnout is common.
     if (votes.length === 0) {
       tallies.push({
         officeId:    office._id.toString(),
@@ -49,17 +69,13 @@ export async function computeTally(
         isTie:       false,
         winner:      null,
         elected:     null,
-        candidates:  candidates.map((c) => ({
-          candidateId: c._id.toString(),
-          fullName:    c.fullName,
-          voteCount:   0,
-        })),
+        candidates:  candidates.map((c) => ({ candidateId: c._id.toString(), fullName: c.fullName, voteCount: 0 })),
       });
       continue;
     }
 
     if (candidates.length === 1) {
-      // ── Confirmation ballot ─────────────────────────────────────────────────
+      // Confirmation ballot
       const approveCount = votes.filter((v) => v.confirmationChoice === 'approve').length;
       const rejectCount  = votes.filter((v) => v.confirmationChoice === 'reject').length;
       const totalVotes   = approveCount + rejectCount;
@@ -75,16 +91,10 @@ export async function computeTally(
         elected:     isTie ? null : approveCount > rejectCount,
         approveCount,
         rejectCount,
-        candidates: [
-          {
-            candidateId: candidates[0]._id.toString(),
-            fullName:    candidates[0].fullName,
-            voteCount:   totalVotes,
-          },
-        ],
+        candidates: [{ candidateId: candidates[0]._id.toString(), fullName: candidates[0].fullName, voteCount: totalVotes }],
       });
     } else {
-      // ── Competitive ballot ──────────────────────────────────────────────────
+      // Competitive ballot
       const countMap: Record<string, { fullName: string; count: number }> = {};
       for (const c of candidates) {
         countMap[c._id.toString()] = { fullName: c.fullName, count: 0 };
@@ -97,15 +107,10 @@ export async function computeTally(
       }
 
       const sorted = Object.entries(countMap)
-        .map(([id, data]) => ({
-          candidateId: id,
-          fullName:    data.fullName,
-          voteCount:   data.count,
-        }))
+        .map(([id, data]) => ({ candidateId: id, fullName: data.fullName, voteCount: data.count }))
         .sort((a, b) => b.voteCount - a.voteCount);
 
-      const isTie        = sorted.length >= 2 && sorted[0].voteCount === sorted[1].voteCount;
-      const topCandidate = sorted[0] ?? null;
+      const isTie = sorted.length >= 2 && sorted[0].voteCount === sorted[1].voteCount;
 
       tallies.push({
         officeId:    office._id.toString(),
@@ -114,11 +119,20 @@ export async function computeTally(
         totalVotes:  votes.length,
         noVotes:     false,
         isTie,
-        winner:      isTie ? null : (topCandidate?.candidateId ?? null),
+        winner:      isTie ? null : (sorted[0]?.candidateId ?? null),
         candidates:  sorted,
       });
     }
   }
 
   return tallies;
+}
+
+export async function getCachedTally(electionId: string): Promise<OfficeTally[] | null> {
+  try {
+    const raw = await redis.get(`tally:${electionId}`);
+    return raw ? (JSON.parse(raw) as OfficeTally[]) : null;
+  } catch {
+    return null;
+  }
 }

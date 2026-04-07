@@ -1,64 +1,79 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { type RateLimitRequestHandler } from 'express-rate-limit';
+import { RedisStore } from 'rate-limit-redis';
+import { redis } from '../config/redis';
+import type { Request, Response, NextFunction } from 'express';
 
 const json = (message: string) => ({ success: false, message });
 
-export const registrationLimiter = rateLimit({
-  windowMs:       60 * 1000,
-  max:            10,
-  message:        json('Too many registration attempts, please try again later'),
-  standardHeaders: true,
-  legacyHeaders:  false,
-});
+interface LimiterConfig {
+  prefix:   string;
+  max:      number;
+  message:  string;
+  windowMs: number;
+}
 
-export const loginLimiter = rateLimit({
-  windowMs:       60 * 1000,
-  max:            10,
-  message:        json('Too many login attempts, please try again later'),
-  standardHeaders: true,
-  legacyHeaders:  false,
-});
+const pendingConfigs: LimiterConfig[] = [];
+const redisLimiters = new Map<string, RateLimitRequestHandler>();
 
-export const otpLimiter = rateLimit({
-  windowMs:       60 * 1000,
-  max:            5,
-  message:        json('Too many OTP attempts, please try again later'),
-  standardHeaders: true,
-  legacyHeaders:  false,
-});
+/**
+ * Must be called once in server.ts after connectRedis() resolves.
+ * Builds all Redis-backed rate limiter instances so they share state
+ * across horizontally-scaled backend nodes.
+ */
+export function initRedisLimiters(): void {
+  for (const cfg of pendingConfigs) {
+    const limiter = rateLimit({
+      windowMs:        cfg.windowMs,
+      max:             cfg.max,
+      standardHeaders: true,
+      legacyHeaders:   false,
+      message:         json(cfg.message),
+      store: new RedisStore({
+        prefix:      cfg.prefix,
+        sendCommand: (...args: string[]) => redis.sendCommand(args),
+      }),
+    });
+    redisLimiters.set(cfg.prefix, limiter);
+  }
+  console.log('[rateLimiter] ✅ Redis-backed limiters initialized');
+}
 
-export const votingLimiter = rateLimit({
-  windowMs:       60 * 1000,
-  max:            5,
-  message:        json('Too many voting requests, please try again later'),
-  standardHeaders: true,
-  legacyHeaders:  false,
-});
+function makeLimiter(
+  prefix:   string,
+  max:      number,
+  message:  string,
+  windowMs = 60_000,
+): (req: Request, res: Response, next: NextFunction) => void {
+  pendingConfigs.push({ prefix, max, message, windowMs });
 
-export const refreshLimiter = rateLimit({
-  windowMs:       60 * 1000,
-  max:            20,
-  message:        json('Too many token refresh attempts'),
-  standardHeaders: true,
-  legacyHeaders:  false,
-});
+  const memLimiter = rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders:   false,
+    message:         json(message),
+  });
 
-export const generalLimiter = rateLimit({
-  windowMs:       60 * 1000,
-  max:            100,
-  message:        json('Too many requests, please slow down'),
-  standardHeaders: true,
-  legacyHeaders:  false,
-});
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const redisLimiter = redisLimiters.get(prefix);
+    if (redis.isOpen && redisLimiter) {
+      return redisLimiter(req, res, next);
+    }
+    console.warn(`[rateLimiter] Redis unavailable — memory fallback active for ${prefix}`);
+    return memLimiter(req, res, next);
+  };
+}
 
-// FIX (Issue 17): The public receipt-verification endpoint had no rate limiting.
-// An attacker could enumerate valid receipt codes by probing the boolean response.
-// Receipt codes are 8 hex chars (4 billion combinations) — not brute-forceable
-// in practice, but the endpoint should still be defended in depth.
-// 10 checks per minute per IP is generous for legitimate use.
-export const receiptLimiter = rateLimit({
-  windowMs:        60 * 1000,
-  max:             10,
-  message:         json('Too many receipt verification attempts, please try again later'),
-  standardHeaders: true,
-  legacyHeaders:   false,
-});
+export const registrationLimiter = makeLimiter('rl:reg:',     10, 'Too many registration attempts, please try again later');
+export const loginLimiter         = makeLimiter('rl:login:',   100000, 'Too many login attempts, please try again later');
+export const otpLimiter           = makeLimiter('rl:otp:',      5, 'Too many OTP attempts, please try again later');
+export const votingLimiter        = makeLimiter('rl:vote:',     50000, 'Too many voting requests, please try again later');
+export const refreshLimiter       = makeLimiter('rl:refresh:', 20, 'Too many token refresh attempts');
+export const generalLimiter       = makeLimiter('rl:general:', 1000000, 'Too many requests, please slow down');
+export const receiptLimiter       = makeLimiter('rl:receipt:', 10, 'Too many receipt verification attempts, please try again later');
+
+/**
+ * F-11: Election code lookups are unauthenticated and short-code brute-forceable.
+ * 10 requests per minute per IP limits enumeration to a crawl.
+ */
+export const codeLookupLimiter = makeLimiter('rl:code:', 10, 'Too many election code lookups, please try again later');

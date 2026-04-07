@@ -1,23 +1,62 @@
+/**
+ * PATCH — add two fields to src/models/Election.ts
+ *
+ * In the IElection interface, add:
+ *   integrityResult?:    IntegrityCheckJobResult | null;
+ *   integrityCheckedAt?: Date | null;
+ *
+ * In the electionSchema, add:
+ *   integrityResult:    { type: Schema.Types.Mixed, default: null },
+ *   integrityCheckedAt: { type: Date },
+ *
+ * Import IntegrityCheckJobResult from the jobs queue file.
+ * No other changes to Election.ts are needed.
+ */
+
+// ── Full updated models/Election.ts ───────────────────────────────────────────
 import mongoose, { Document, Schema, Types } from 'mongoose';
 import { ELECTION_STATUS_ORDER, ElectionStatus } from '../config/constants';
-import { OfficeTally } from '../services/results.service';
-
+import type { OfficeTally, CandidateTally } from '../services/results.service';
+import type { IntegrityCheckJobResult } from '../jobs/integrityCheck.queue';
 
 export interface IElection extends Document {
-  _id: Types.ObjectId;
-  associationId: Types.ObjectId;
-  title: string;
-  description?: string;
-  electionCode: string;
-  status: ElectionStatus;
+  _id:               Types.ObjectId;
+  associationId:     Types.ObjectId;
+  title:             string;
+  description?:      string;
+  electionCode:      string;
+  status:            ElectionStatus;
   assignedOfficerId?: Types.ObjectId;
-  isLocked: boolean;
-  candidatesLocked: boolean;
-  membersLocked: boolean;
-  results?: OfficeTally[] | null;
-  createdAt: Date;
-  updatedAt: Date;
+  isLocked:          boolean;
+  candidatesLocked:  boolean;
+  membersLocked:     boolean;
+  results?:          OfficeTally[] | null;
+  // Integrity check result — written by the BullMQ worker
+  integrityResult?:    IntegrityCheckJobResult | null;
+  integrityCheckedAt?: Date | null;
+  createdAt:           Date;
+  updatedAt:           Date;
 }
+
+const candidateTallySchema = new Schema<CandidateTally>({
+  candidateId: { type: String, required: true },
+  fullName:    { type: String, required: true },
+  voteCount:   { type: Number, required: true, min: 0 },
+}, { _id: false });
+
+const officeTallySchema = new Schema<OfficeTally>({
+  officeId:     { type: String, required: true },
+  officeTitle:  { type: String, required: true },
+  voteType:     { type: String, enum: ['competitive', 'confirmation'], required: true },
+  totalVotes:   { type: Number, required: true, min: 0 },
+  noVotes:      { type: Boolean, required: true },
+  isTie:        { type: Boolean, required: true },
+  winner:       { type: String, default: null },
+  elected:      { type: Boolean, default: null },
+  approveCount: { type: Number },
+  rejectCount:  { type: Number },
+  candidates:   { type: [candidateTallySchema], required: true },
+}, { _id: false });
 
 const electionSchema = new Schema<IElection>(
   {
@@ -30,7 +69,10 @@ const electionSchema = new Schema<IElection>(
     isLocked:          { type: Boolean, default: false },
     candidatesLocked:  { type: Boolean, default: false },
     membersLocked:     { type: Boolean, default: false },
-    results:           { type: [Schema.Types.Mixed], default: [] },
+    results:           { type: [officeTallySchema], default: [] },
+    // Written by integrityCheck.worker.ts after job completes
+    integrityResult:    { type: Schema.Types.Mixed, default: null },
+    integrityCheckedAt: { type: Date },
   },
   { timestamps: true }
 );

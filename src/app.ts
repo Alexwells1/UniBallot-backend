@@ -57,10 +57,6 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
-// ── Logging ──────────────────────────────────────────────────────────────────
-// FIX (Issue 14): 'dev' format in production logs colorised output and can
-// expose Authorization headers / query-string tokens. Use 'combined' (Apache
-// format, no color, standard fields) in production; keep 'dev' locally.
 app.use(morgan(env.NODE_ENV === "production" ? "combined" : "dev"));
 
 // ── Global rate limiter ───────────────────────────────────────────────────────

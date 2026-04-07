@@ -5,21 +5,21 @@ import { validate } from '../middleware/validate';
 import { uploadAvatar } from '../middleware/upload';
 import {
   getMe,
-  completeProfile,   profileSchema,
+  completeProfile,     profileSchema,
+  updateProfile,       updateProfileSchema,
   uploadAvatarHandler,
-  changePassword,    passwordChangeSchema,
+  changePassword,      passwordChangeSchema,
 } from '../controllers/user.controller';
 
 const router = Router();
 
 router.use(authenticate);
 
-// All authenticated roles
-router.get('/me',         getMe);
-router.post('/me/avatar', uploadAvatar, uploadAvatarHandler);
+router.get('/me',          getMe);
+router.post('/me/avatar',  uploadAvatar, uploadAvatarHandler);
 router.put('/me/password', validate(passwordChangeSchema), changePassword);
 
-// Students only
-router.put('/me/profile', authorize('student'), validate(profileSchema), completeProfile);
+router.put(   '/me/profile', authorize('student'), validate(profileSchema),       completeProfile);
+router.patch( '/me/profile', authorize('student'), validate(updateProfileSchema),  updateProfile);
 
 export default router;

@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
-import OtpVerification from '../models/OtpVerification';
+import { redis } from '../config/redis';
 import {
   OTP_EXPIRY_MINUTES,
   OTP_MAX_ATTEMPTS,
@@ -9,7 +9,35 @@ import {
 } from '../config/constants';
 import { AppError } from '../utils/AppError';
 
-// -- Helpers ------------------------------------------------------------------
+const OTP_TTL_SECONDS = OTP_EXPIRY_MINUTES * 60;
+
+interface OtpSession {
+  otpHash:      string;
+  passwordHash: string;
+  attempts:     number;
+  resendAttempts: number;
+  locked:       boolean;
+  expiresAt:    number;
+  updatedAt:    number;
+}
+
+function sessionKey(email: string): string {
+  return `otp:${email}`;
+}
+
+async function readSession(email: string): Promise<OtpSession | null> {
+  const raw = await redis.get(sessionKey(email)).catch(() => null);
+  if (!raw) return null;
+  return JSON.parse(raw) as OtpSession;
+}
+
+async function writeSession(email: string, session: OtpSession, ttlSeconds: number): Promise<void> {
+  await redis.setEx(sessionKey(email), ttlSeconds, JSON.stringify(session));
+}
+
+async function deleteSession(email: string): Promise<void> {
+  await redis.del(sessionKey(email)).catch(() => null);
+}
 
 export function generateOtp(): string {
   return crypto.randomInt(100_000, 999_999).toString();
@@ -23,55 +51,38 @@ export async function verifyOtp(submitted: string, hash: string): Promise<boolea
   return bcrypt.compare(submitted, hash);
 }
 
-// -- Core OTP record operations -----------------------------------------------
-
 /**
- * Creates or resets an OTP record for the given email.
+ * Creates or resets an OTP session stored in Redis with a 15-minute TTL.
+ * Sensitive data never reaches MongoDB — the session is ephemeral by design.
  *
- * Decision table:
- *   - No record exists                -> create fresh, return { reused: false }
- *   - Record exists, locked           -> replaceOne atomically, return { reused: false }
- *   - Record exists, expired          -> replaceOne atomically, return { reused: false }
- *   - Record exists, valid + unlocked -> return { reused: true } (caller throws OTP_ALREADY_SENT)
- *
- * The previous implementation used deleteOne + findOneAndUpdate (two round trips).
- * fetchOtpStatus could fire in the gap and still read the old locked document.
- * replaceOne with upsert:true is a single atomic operation that eliminates the gap.
+ * Returns { reused: true } if a valid, unlocked session already exists
+ * so the caller can redirect instead of creating a duplicate.
  */
 export async function createOtpRecord(
-  email: string,
+  email:        string,
   passwordHash: string
 ): Promise<{ otp: string; reused: false } | { otp: null; reused: true }> {
-  const now      = new Date();
-  const existing = await OtpVerification.findOne({ email });
+  const existing = await readSession(email);
+  const now      = Date.now();
 
-  // Valid, unlocked, unexpired -- do not overwrite, tell caller to redirect
   if (existing && existing.expiresAt > now && !existing.locked) {
     return { otp: null, reused: true };
   }
 
-  // Locked, expired, or absent -- single atomic replaceOne + upsert.
-  // No two-step delete then insert, so there is no window where the old
-  // locked document is still readable.
-  const otp       = generateOtp();
-  const otpHash   = await hashOtp(otp);
-  const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1_000);
+  const otp     = generateOtp();
+  const otpHash = await hashOtp(otp);
 
-  await OtpVerification.replaceOne(
-    { email },
-    {
-      email,
-      otpHash,
-      passwordHash,
-      attempts:       0,
-      resendAttempts: 0,
-      locked:         false,
-      expiresAt,
-      createdAt:      now,
-      updatedAt:      now,
-    },
-    { upsert: true }
-  );
+  const session: OtpSession = {
+    otpHash,
+    passwordHash,
+    attempts:       0,
+    resendAttempts: 0,
+    locked:         false,
+    expiresAt:      now + OTP_TTL_SECONDS * 1_000,
+    updatedAt:      now,
+  };
+
+  await writeSession(email, session, OTP_TTL_SECONDS);
 
   if (process.env.NODE_ENV === 'development') {
     console.log(`[DEV] OTP for ${email}: ${otp}`);
@@ -80,65 +91,51 @@ export async function createOtpRecord(
   return { otp, reused: false };
 }
 
-// -- Resend -------------------------------------------------------------------
-
 export async function resendOtp(email: string): Promise<string> {
-  const record = await OtpVerification.findOne({ email });
+  const session = await readSession(email);
 
-  if (!record) {
+  if (!session) {
     throw new AppError(400, 'No pending verification found for this email', 'OTP_NOT_FOUND');
   }
 
-  if (record.locked) {
-    throw new AppError(
-      429,
-      'Too many attempts. Please register again to get a new code.',
-      'OTP_LOCKED'
-    );
+  const now = Date.now();
+
+  if (session.locked) {
+    throw new AppError(429, 'Too many attempts. Please register again to get a new code.', 'OTP_LOCKED');
   }
 
-  if (record.expiresAt < new Date()) {
+  if (session.expiresAt < now) {
     throw new AppError(400, 'Verification session has expired. Please register again.', 'OTP_EXPIRED');
   }
 
-  const now             = new Date();
-
-  // Check max resend attempts FIRST -- before rate limiting -- so the locked
-  // flag is always written regardless of whether the interval check fires.
-  // Previously this ran after the interval check, leaving records in a state
-  // where resendAttempts == max but locked == false when the rate limit hit first.
-  if (record.resendAttempts >= OTP_RESEND_MAX_ATTEMPTS) {
-    await OtpVerification.updateOne({ email }, { $set: { locked: true, updatedAt: now } });
-    throw new AppError(
-      429,
-      'Too many resend attempts. Please register again to get a new code.',
-      'OTP_LOCKED'
-    );
+  if (session.resendAttempts >= OTP_RESEND_MAX_ATTEMPTS) {
+    session.locked    = true;
+    session.updatedAt = now;
+    await writeSession(email, session, Math.ceil((session.expiresAt - now) / 1_000));
+    throw new AppError(429, 'Too many resend attempts. Please register again.', 'OTP_LOCKED');
   }
 
   const minIntervalMs   = OTP_RESEND_INTERVAL_SECONDS * 1_000;
-  const timeSinceUpdate = now.getTime() - record.updatedAt.getTime();
+  const timeSinceUpdate = now - session.updatedAt;
 
   if (timeSinceUpdate < minIntervalMs) {
     const secondsLeft = Math.ceil((minIntervalMs - timeSinceUpdate) / 1_000);
-    throw new AppError(
-      429,
-      `Please wait ${secondsLeft} seconds before requesting another code.`,
-      'RATE_LIMITED'
-    );
+    throw new AppError(429, `Please wait ${secondsLeft} seconds before requesting another code.`, 'RATE_LIMITED');
   }
 
-  const newOtp       = generateOtp();
-  const newOtpHash   = await hashOtp(newOtp);
-  const newExpiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1_000);
+  const newOtp    = generateOtp();
+  const newHash   = await hashOtp(newOtp);
+  const newExpiry = now + OTP_TTL_SECONDS * 1_000;
 
-  await OtpVerification.updateOne(
-    { email },
-    {
-      $set: { otpHash: newOtpHash, expiresAt: newExpiresAt, attempts: 0, updatedAt: now },
-      $inc: { resendAttempts: 1 },
-    }
-  );
+  const updated: OtpSession = {
+    ...session,
+    otpHash:        newHash,
+    expiresAt:      newExpiry,
+    attempts:       0,
+    resendAttempts: session.resendAttempts + 1,
+    updatedAt:      now,
+  };
+  await writeSession(email, updated, OTP_TTL_SECONDS);
 
   if (process.env.NODE_ENV === 'development') {
     console.log(`[DEV] Resent OTP for ${email}: ${newOtp}`);
@@ -146,8 +143,6 @@ export async function resendOtp(email: string): Promise<string> {
 
   return newOtp;
 }
-
-// -- OTP status ---------------------------------------------------------------
 
 export interface OtpStatusResult {
   exists:           boolean;
@@ -158,22 +153,22 @@ export interface OtpStatusResult {
 }
 
 export async function getOtpStatus(email: string): Promise<OtpStatusResult> {
-  const record = await OtpVerification.findOne({ email });
+  const session = await readSession(email);
 
-  if (!record) {
+  if (!session) {
     return { exists: false, canResend: false, secondsRemaining: 0, locked: false, expired: false };
   }
 
-  const now     = new Date();
-  const expired = record.expiresAt < now;
-  const locked  = record.locked || record.resendAttempts >= OTP_RESEND_MAX_ATTEMPTS;
+  const now     = Date.now();
+  const expired = session.expiresAt < now;
+  const locked  = session.locked || session.resendAttempts >= OTP_RESEND_MAX_ATTEMPTS;
 
   if (expired || locked) {
     return { exists: true, canResend: false, secondsRemaining: 0, locked, expired };
   }
 
   const minIntervalMs   = OTP_RESEND_INTERVAL_SECONDS * 1_000;
-  const timeSinceUpdate = now.getTime() - record.updatedAt.getTime();
+  const timeSinceUpdate = now - session.updatedAt;
   const msRemaining     = minIntervalMs - timeSinceUpdate;
 
   if (msRemaining > 0) {
@@ -189,30 +184,44 @@ export async function getOtpStatus(email: string): Promise<OtpStatusResult> {
   return { exists: true, canResend: true, secondsRemaining: 0, locked: false, expired: false };
 }
 
-// -- Misc helpers -------------------------------------------------------------
-
 export async function incrementAttempts(email: string): Promise<void> {
-  const record = await OtpVerification.findOneAndUpdate(
-    { email },
-    {
-      $inc: { attempts: 1 },
-      $set: { updatedAt: new Date() },
-    },
-    { new: true }
-  );
+  const session = await readSession(email);
+  if (!session) return;
 
-  if (record && record.attempts >= OTP_MAX_ATTEMPTS) {
-    await OtpVerification.updateOne(
-      { email },
-      { $set: { locked: true, updatedAt: new Date() } }
-    );
+  session.attempts  += 1;
+  session.updatedAt  = Date.now();
+
+  if (session.attempts >= OTP_MAX_ATTEMPTS) {
+    session.locked = true;
   }
+
+  const ttlSeconds = Math.max(1, Math.ceil((session.expiresAt - Date.now()) / 1_000));
+  await writeSession(email, session, ttlSeconds);
 }
 
-export async function getOtpRecord(email: string) {
-  return OtpVerification.findOne({ email });
+/**
+ * Returns a partial session object for the auth controller to validate an OTP.
+ * All data is read from Redis — the sole source of truth for OTP sessions.
+ * `attempts` is included so the controller can compute remaining attempts accurately.
+ */
+export async function getOtpRecord(email: string): Promise<{
+  otpHash:      string;
+  passwordHash: string;
+  locked:       boolean;
+  expiresAt:    Date;
+  attempts:     number;
+} | null> {
+  const session = await readSession(email);
+  if (!session) return null;
+  return {
+    otpHash:      session.otpHash,
+    passwordHash: session.passwordHash,
+    locked:       session.locked,
+    expiresAt:    new Date(session.expiresAt),
+    attempts:     session.attempts,
+  };
 }
 
 export async function deleteOtpRecord(email: string): Promise<void> {
-  await OtpVerification.deleteOne({ email });
+  await deleteSession(email);
 }

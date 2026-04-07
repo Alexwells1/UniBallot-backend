@@ -15,9 +15,10 @@ import { sendSuccess, sendPaginated } from '../utils/apiResponse';
 import { generateElectionCode } from '../utils/generateCode';
 import { logAction } from '../services/audit.service';
 import { AUDIT_ACTIONS, ELECTION_STATUS_ORDER, ElectionStatus } from '../config/constants';
-import { computeTally } from '../services/results.service';
-
-// ── Zod schemas ───────────────────────────────────────────────────────────────
+import { computeTally, getCachedTally } from '../services/results.service';
+import { redis } from '../config/redis';
+import { generateCsv, streamPdf } from '../services/export.service';
+import type { IElection } from '../models/Election';
 
 export const createElectionSchema = z.object({
   associationId: z.string().min(1, 'associationId is required'),
@@ -25,7 +26,14 @@ export const createElectionSchema = z.object({
   description:   z.string().optional(),
 });
 
-// ── CRUD ──────────────────────────────────────────────────────────────────────
+/**
+ * Typed aggregate result for listMyElections.
+ * Extends IElection with the hasVoted field projected from the RegisteredVoter join.
+ */
+interface MyElectionResult extends Omit<IElection, 'reg'> {
+  hasVoted?: boolean;
+  association?: { _id: string; name: string };
+}
 
 export const createElection = asyncHandler(async (req: Request, res: Response) => {
   const { associationId, title, description } = req.body as z.infer<typeof createElectionSchema>;
@@ -34,7 +42,9 @@ export const createElection = asyncHandler(async (req: Request, res: Response) =
   if (!association) throw new AppError(404, 'Association not found');
 
   const electionCode = await generateElectionCode();
-  const election = await Election.create({ associationId, title, description, electionCode, status: 'draft' });
+  const election = await Election.create({
+    associationId, title, description, electionCode, status: 'draft',
+  });
 
   await logAction({
     action:      AUDIT_ACTIONS.ELECTION_CREATED,
@@ -56,13 +66,18 @@ export const listElections = asyncHandler(async (req: Request, res: Response) =>
   if (req.user.role === 'officer') filter.assignedOfficerId = req.user._id;
   if (associationId) filter.associationId = new mongoose.Types.ObjectId(associationId);
   if (status) filter.status = status;
-  if (search) filter.title  = { $regex: search, $options: 'i' };
+  if (search) {
+    const escaped = (search as string).slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    filter.title = { $regex: escaped, $options: 'i' };
+  }
 
   const [elections, total] = await Promise.all([
     Election.find(filter)
-      .populate('associationId',     'name')
+      .populate('associationId', 'name')
       .populate('assignedOfficerId', 'fullName email')
-      .skip(skip).limit(limitNum).sort({ createdAt: -1 }),
+      .skip(skip)
+      .limit(limitNum)
+      .sort({ createdAt: -1 }),
     Election.countDocuments(filter),
   ]);
 
@@ -71,16 +86,16 @@ export const listElections = asyncHandler(async (req: Request, res: Response) =>
 
 export const getElection = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id)
-    .populate('associationId',     'name')
+    .populate('associationId', 'name')
     .populate('assignedOfficerId', 'fullName email');
   if (!election) throw new AppError(404, 'Election not found');
   sendSuccess(res, election);
 });
 
-/** Public — returns only safe fields; no officer/results/sensitive data */
 export const getElectionByCode = asyncHandler(async (req: Request, res: Response) => {
-  const election = await Election.findOne({ electionCode: req.params.code.toUpperCase() })
-    .populate<{ associationId: { name: string } }>('associationId', 'name');
+  const election = await Election.findOne({
+    electionCode: req.params.code.toUpperCase(),
+  }).populate<{ associationId: { name: string } }>('associationId', 'name');
   if (!election) throw new AppError(404, 'Election not found');
 
   sendSuccess(res, {
@@ -91,26 +106,21 @@ export const getElectionByCode = asyncHandler(async (req: Request, res: Response
   });
 });
 
-
 export const getOpenElections = asyncHandler(async (_req: Request, res: Response) => {
-  const elections = await Election.find({
-    status:   'registration_open',
-    isLocked: false,
-  })
+  const elections = await Election.find({ status: 'registration_open', isLocked: false })
     .populate<{ associationId: { name: string } }>('associationId', 'name')
     .sort({ createdAt: -1 })
     .lean();
- 
+
   const safe = elections.map((e) => ({
     title:           e.title,
     associationName: (e.associationId as unknown as { name: string }).name,
     electionCode:    e.electionCode,
     status:          e.status,
   }));
- 
+
   sendSuccess(res, safe);
 });
-
 
 export const updateElection = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id);
@@ -132,8 +142,6 @@ export const updateElection = asyncHandler(async (req: Request, res: Response) =
   sendSuccess(res, updated, 'Election updated');
 });
 
-// ── Officer assignment (SA only — route: /api/super-admin/elections/:id/assign-officer) ─────
-
 export const assignOfficer = asyncHandler(async (req: Request, res: Response) => {
   const { officerId } = req.body as { officerId: string };
 
@@ -144,10 +152,9 @@ export const assignOfficer = asyncHandler(async (req: Request, res: Response) =>
   if (!officer || officer.role !== 'officer') throw new AppError(400, 'User is not an officer');
   if (!officer.isActive || officer.isSuspended) throw new AppError(400, 'Officer account is not active');
 
-  // One officer per active (non-results_published) election
   const alreadyAssigned = await Election.findOne({
     assignedOfficerId: officerId,
-    _id:    { $ne: election._id },
+    _id: { $ne: election._id },
     status: { $ne: 'results_published' },
   });
   if (alreadyAssigned) throw new AppError(409, 'Officer is already assigned to another active election');
@@ -163,8 +170,6 @@ export const assignOfficer = asyncHandler(async (req: Request, res: Response) =>
 
   sendSuccess(res, null, 'Officer assigned');
 });
-
-// ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 export const transitionStatus = asyncHandler(async (req: Request, res: Response) => {
   const { status: newStatus } = req.body as { status: string };
@@ -185,7 +190,6 @@ export const transitionStatus = asyncHandler(async (req: Request, res: Response)
     throw new AppError(400, 'Officers may only advance to the immediate next status');
   }
 
-  // Pre-transition business rules
   if (typedStatus === 'registration_open') {
     const memberCount = await AssociationMember.countDocuments({ electionId: election._id });
     if (memberCount === 0) throw new AppError(400, 'Upload at least one member before opening registration');
@@ -200,13 +204,24 @@ export const transitionStatus = asyncHandler(async (req: Request, res: Response)
     }
   }
 
+  if (typedStatus === 'results_published') {
+    throw new AppError(400, 'Use POST /elections/:id/publish-results to publish results.', 'USE_PUBLISH_ENDPOINT');
+  }
+
   const updateFields: Record<string, unknown> = { status: typedStatus };
   if (typedStatus === 'voting_open') {
     updateFields.candidatesLocked = true;
     updateFields.membersLocked    = true;
   }
 
-  await Election.findByIdAndUpdate(election._id, { $set: updateFields });
+  const updated = await Election.findByIdAndUpdate(
+    election._id,
+    { $set: updateFields },
+    { new: true }
+  )
+    .populate('associationId', 'name')
+    .populate('assignedOfficerId', 'fullName email');
+
   await logAction({
     action:      AUDIT_ACTIONS.STATUS_CHANGED,
     performedBy: req.user._id,
@@ -215,7 +230,7 @@ export const transitionStatus = asyncHandler(async (req: Request, res: Response)
     metadata:    { from: election.status, to: typedStatus },
   });
 
-  sendSuccess(res, null, `Election status changed to ${typedStatus}`);
+  sendSuccess(res, updated, `Election status changed to ${typedStatus}`);
 });
 
 export const toggleLockdown = asyncHandler(async (req: Request, res: Response) => {
@@ -228,40 +243,36 @@ export const toggleLockdown = asyncHandler(async (req: Request, res: Response) =
   if (!election) throw new AppError(404, 'Election not found');
 
   const action = active ? AUDIT_ACTIONS.LOCKDOWN_ACTIVATED : AUDIT_ACTIONS.LOCKDOWN_DEACTIVATED;
-  await logAction({ action, performedBy: req.user._id, targetId: election._id, targetModel: 'Election' });
+  await logAction({
+    action,
+    performedBy: req.user._id,
+    targetId:    election._id,
+    targetModel: 'Election',
+  });
   sendSuccess(res, null, `Lockdown ${active ? 'activated' : 'deactivated'}`);
 });
 
-// ── Student election registration ─────────────────────────────────────────────
-
 export const registerForElection = asyncHandler(async (req: Request, res: Response) => {
   const { electionCode } = req.body as { electionCode: string };
- 
-  // Ensure user has completed their profile
+
   if (!req.user.profileCompleted) {
     throw new AppError(400, 'Complete your profile before registering for elections');
   }
- 
-  // Ensure user has a matric number
   if (!req.user.matricNumber) {
     throw new AppError(400, 'Your profile must include a matric number to register for elections');
   }
- 
-  // Find the election
+
   const election = await Election.findOne({ electionCode: electionCode.toUpperCase() });
   if (!election) throw new AppError(404, 'Election not found');
-  if (election.status !== 'registration_open') 
-    throw new AppError(400, 'Registration is not open for this election');
+  if (election.status !== 'registration_open') throw new AppError(400, 'Registration is not open for this election');
   if (election.isLocked) throw new AppError(423, 'Election is in lockdown');
- 
-  // Check eligibility using matric number
+
   const eligible = await AssociationMember.findOne({
     electionId:   election._id,
     matricNumber: req.user.matricNumber,
   });
   if (!eligible) throw new AppError(403, 'You are not on the eligibility list for this election');
- 
-  // Register user as a voter (upsert - create if not exists)
+
   const existingVoter = await RegisteredVoter.findOneAndUpdate(
     { electionId: election._id, userId: req.user._id },
     {
@@ -273,13 +284,8 @@ export const registerForElection = asyncHandler(async (req: Request, res: Respon
     },
     { upsert: true, new: false }
   );
- 
-  // If existingVoter is not null, the user was already registered
-  if (existingVoter !== null) {
-    throw new AppError(409, 'You are already registered for this election');
-  }
- 
-  // Log the registration action
+  if (existingVoter !== null) throw new AppError(409, 'You are already registered for this election');
+
   await logAction({
     action:      AUDIT_ACTIONS.VOTER_REGISTERED,
     performedBy: req.user._id,
@@ -287,91 +293,112 @@ export const registerForElection = asyncHandler(async (req: Request, res: Respon
     targetModel: 'RegisteredVoter',
     metadata:    { electionId: election._id.toString(), matricNumber: req.user.matricNumber },
   });
- 
+
   sendSuccess(res, null, 'Successfully registered for election', 201);
 });
-
-// ── Results ───────────────────────────────────────────────────────────────────
 
 export const publishResults = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');
-  if (election.status !== 'voting_closed') throw new AppError(400, 'Election must be in voting_closed status to publish results');
 
   const tally = await computeTally(election._id.toString());
-  if (!tally || tally.length === 0) {
-    throw new AppError(400, 'No votes found for this election');
+  if (!tally || tally.length === 0) throw new AppError(400, 'No votes found for this election');
+
+  const updated = await Election.findOneAndUpdate(
+    { _id: election._id, status: 'voting_closed' },
+    { $set: { results: tally, status: 'results_published' } },
+    { new: true, runValidators: true }
+  );
+
+  if (!updated) {
+    const current = await Election.findById(election._id).select('status');
+    if (current?.status === 'results_published') throw new AppError(409, 'Results have already been published');
+    throw new AppError(400, 'Election is not in voting_closed status');
   }
 
-  await Election.findByIdAndUpdate(election._id, { $set: { results: tally, status: 'results_published' } });
+  const cacheKey = `tally:${election._id}`;
+  await redis.del(cacheKey);
+  await redis.setEx(cacheKey, 3_600, JSON.stringify(tally)).catch(() => null);
 
   await logAction({
-    action: AUDIT_ACTIONS.RESULTS_PUBLISHED,
+    action:      AUDIT_ACTIONS.RESULTS_PUBLISHED,
     performedBy: req.user._id,
-    targetId: election._id,
+    targetId:    election._id,
     targetModel: 'Election',
   });
 
-  const hasTies = tally.some((t) => t.isTie);
+  const hasTies    = tally.some((t) => t.isTie);
   const tiedOffices = tally.filter((t) => t.isTie).map((t) => t.officeTitle);
   sendSuccess(res, { hasTies, tiedOffices }, 'Results published');
 });
 
-/** Published results — students (registered voters only) or SA */
+/**
+ * Returns published results for registered voters and admins.
+ * For results_published elections, serves stored results directly from the
+ * Election document without recomputing, then falls back to cached tally.
+ */
 export const getResults = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');
   if (election.status !== 'results_published') throw new AppError(403, 'Results are not yet published');
 
   if (req.user.role === 'student') {
-    const isRegistered = await RegisteredVoter.findOne({
-      electionId: election._id,
-      userId:     req.user._id,
-    });
+    const isRegistered = await RegisteredVoter.findOne({ electionId: election._id, userId: req.user._id });
     if (!isRegistered) throw new AppError(403, 'Only registered voters can view results');
   }
 
-  sendSuccess(res, election.results || []);
+  if (election.results?.length) {
+    return sendSuccess(res, election.results);
+  }
+
+  const cached = await getCachedTally(election._id.toString());
+  if (cached) return sendSuccess(res, cached);
+
+  const tally = await computeTally(election._id.toString());
+  await redis.setEx(`tally:${election._id}`, 3_600, JSON.stringify(tally)).catch(() => null);
+  sendSuccess(res, tally);
 });
 
-/** Same as getResults but accessed via election code — student-facing UX */
 export const getResultsByCode = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findOne({ electionCode: req.params.code.toUpperCase() });
   if (!election) throw new AppError(404, 'Election not found');
   if (election.status !== 'results_published') throw new AppError(403, 'Results are not yet published');
 
   if (req.user.role === 'student') {
-    const isRegistered = await RegisteredVoter.findOne({
-      electionId: election._id,
-      userId:     req.user._id,
-    });
+    const isRegistered = await RegisteredVoter.findOne({ electionId: election._id, userId: req.user._id });
     if (!isRegistered) throw new AppError(403, 'Only registered voters can view results');
   }
 
   sendSuccess(res, election.results || []);
 });
 
-/** Live preview — officer (own election) or SA; available after voting_closed */
+/**
+ * Live preview for officers and super admins after voting closes.
+ * Results are cached for 60 seconds (tally:preview prefix) to avoid
+ * repeated full Vote aggregations when admins refresh rapidly.
+ */
 export const previewResults = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');
   if (!['voting_closed', 'results_published'].includes(election.status)) {
     throw new AppError(400, 'Results preview is only available after voting has closed');
   }
-  const tally = await computeTally(election._id.toString());
-  sendSuccess(res, tally, 'Live preview (not yet published)');
-});
 
-// ── Analytics ─────────────────────────────────────────────────────────────────
+  const previewKey = `tally:preview:${req.params.id}`;
+  const cached = await redis.get(previewKey).catch(() => null);
+  if (cached) return sendSuccess(res, JSON.parse(cached), 'Live preview (cached)');
+
+  const tally = await computeTally(election._id.toString());
+  await redis.setEx(previewKey, 60, JSON.stringify(tally)).catch(() => null);
+  sendSuccess(res, tally, 'Live preview');
+});
 
 export const getAnalytics = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');
 
-  // Available from registration_open onwards
   const validStatuses: ElectionStatus[] = [
-    'registration_open', 'registration_closed',
-    'voting_open', 'voting_closed', 'results_published',
+    'registration_open', 'registration_closed', 'voting_open', 'voting_closed', 'results_published',
   ];
   if (!validStatuses.includes(election.status)) {
     throw new AppError(400, 'Analytics are only available from registration_open onwards');
@@ -382,22 +409,14 @@ export const getAnalytics = asyncHandler(async (req: Request, res: Response) => 
     RegisteredVoter.countDocuments({ electionId: election._id }),
     RegisteredVoter.countDocuments({ electionId: election._id, hasVoted: true }),
     Office.find({ electionId: election._id }),
-    // FIX (Issue 11): Single aggregation replaces O(N) countDocuments per office.
-    // Previously a separate Vote.countDocuments was fired for every office inside
-    // Promise.all — e.g. 10 offices = 11 DB round-trips. Now it is 1.
     Vote.aggregate<{ _id: string; count: number }>([
       { $match: { electionId: election._id } },
       { $group: { _id: '$officeId', count: { $sum: 1 } } },
     ]),
   ]);
 
-  // Build O(1) lookup map from aggregation result
   const voteCountMap = new Map(voteCountsRaw.map((r) => [r._id.toString(), r.count]));
-
-  const turnoutPercent = registeredVoters > 0
-    ? Math.round((votesCast / registeredVoters) * 100)
-    : 0;
-
+  const turnoutPercent = registeredVoters > 0 ? Math.round((votesCast / registeredVoters) * 100) : 0;
   const officeBreakdown = offices.map((o) => ({
     officeTitle: o.title,
     voteCount:   voteCountMap.get(o._id.toString()) ?? 0,
@@ -406,20 +425,50 @@ export const getAnalytics = asyncHandler(async (req: Request, res: Response) => 
   sendSuccess(res, { totalMembers, registeredVoters, votesCast, turnoutPercent, officeBreakdown });
 });
 
-
+/**
+ * Returns all elections the authenticated student is registered for.
+ * Uses localField/foreignField $lookup (index-optimised) instead of a pipeline $lookup,
+ * adds hasVoted per election (F-02/F-12), and strips heavy tally data from the list (F-04).
+ */
 export const listMyElections = asyncHandler(async (req: Request, res: Response) => {
+  const { page = '1', limit = '20' } = req.query as Record<string, string>;
+  const pageNum  = Math.max(1, parseInt(page, 10));
+  const limitNum = Math.min(50, Math.max(1, parseInt(limit, 10)));
+  const skip     = (pageNum - 1) * limitNum;
 
-  const registrations = await RegisteredVoter.find({
-    userId: req.user._id
-  }).select("electionId");
-
-  const electionIds = registrations.map(r => r.electionId);
-
-  const elections = await Election.find({
-    _id: { $in: electionIds }
-  })
-  .populate("associationId", "name")
-  .sort({ createdAt: -1 });
+  const elections = await Election.aggregate<MyElectionResult>([
+    {
+      $lookup: {
+        from:         'registeredvoters',
+        localField:   '_id',
+        foreignField: 'electionId',
+        as:           'reg',
+        pipeline: [
+          { $match: { $expr: { $eq: ['$userId', new mongoose.Types.ObjectId(req.user._id.toString())] } } },
+          { $limit: 1 },
+        ],
+      },
+    },
+    { $match: { 'reg.0': { $exists: true } } },
+    {
+      $addFields: {
+        hasVoted: { $ifNull: [{ $arrayElemAt: ['$reg.hasVoted', 0] }, false] },
+      },
+    },
+    { $project: { reg: 0, results: 0, integrityResult: 0 } },
+    { $sort: { createdAt: -1 } },
+    { $skip: skip },
+    { $limit: limitNum },
+    {
+      $lookup: {
+        from:         'associations',
+        localField:   'associationId',
+        foreignField: '_id',
+        as:           'association',
+      },
+    },
+    { $unwind: { path: '$association', preserveNullAndEmptyArrays: true } },
+  ]);
 
   sendSuccess(res, elections);
 });
@@ -428,37 +477,25 @@ export const deleteElection = asyncHandler(async (req: Request, res: Response) =
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');
 
-  // Permanently blocked — published results are the historical record
   if (election.status === 'results_published') {
-    throw new AppError(
-      403,
-      'Published elections cannot be deleted — they are part of the historical record'
-    );
+    throw new AppError(403, 'Published elections cannot be deleted — they are part of the historical record');
   }
 
-  // Any status beyond draft means real data exists — require explicit confirmation
   if (election.status !== 'draft') {
     const { force } = req.body as { force?: boolean };
     if (!force) {
       throw new AppError(
         409,
         `Election is in "${election.status}" status and already has data attached. ` +
-          'Send { "force": true } to confirm cascade deletion of all attached data.'
+        'Send { "force": true } to confirm cascade deletion of all attached data.'
       );
     }
   }
 
-  // ── 1. Votes ──────────────────────────────────────────────────────────────
   await Vote.deleteMany({ electionId: election._id });
-
-  // ── 2. Registered voters ──────────────────────────────────────────────────
   await RegisteredVoter.deleteMany({ electionId: election._id });
 
-  // ── 3. Candidate Cloudinary photos — best-effort ──────────────────────────
-  const candidates = await Candidate.find(
-    { electionId: election._id },
-    { photoPublicId: 1 }          // only fetch the field we need
-  );
+  const candidates = await Candidate.find({ electionId: election._id }, { photoPublicId: 1 });
   const { deleteImage } = await import('../services/upload.service');
   let photoFailures = 0;
   for (const candidate of candidates) {
@@ -471,31 +508,43 @@ export const deleteElection = asyncHandler(async (req: Request, res: Response) =
     }
   }
 
-  // ── 4. Candidate documents ────────────────────────────────────────────────
   await Candidate.deleteMany({ electionId: election._id });
-
-  // ── 5. Offices ────────────────────────────────────────────────────────────
   await Office.deleteMany({ electionId: election._id });
-
-  // ── 6. Association member list ────────────────────────────────────────────
   await AssociationMember.deleteMany({ electionId: election._id });
-
-  // ── 7. Election document ──────────────────────────────────────────────────
   await Election.findByIdAndDelete(election._id);
 
-  // Audit — log before returning so any DB failure is surfaced, not silenced
   await logAction({
     action:      AUDIT_ACTIONS.ELECTION_DELETED,
     performedBy: req.user._id,
     targetId:    election._id,
     targetModel: 'Election',
-    metadata: {
-      title:         election.title,
-      deletedStatus: election.status,
-      forced:        election.status !== 'draft',
-      photoFailures,
-    },
+    metadata:    { title: election.title, deletedStatus: election.status, forced: election.status !== 'draft', photoFailures },
   });
 
   res.status(204).send();
+});
+
+export const exportResultsCsv = asyncHandler(async (req: Request, res: Response) => {
+  const election = await Election.findById(req.params.id);
+  if (!election) throw new AppError(404, 'Election not found');
+  if (election.status !== 'results_published') throw new AppError(400, 'Results must be published before exporting');
+
+  const tally    = await computeTally(election._id.toString());
+  const csv      = generateCsv(election, tally);
+  const filename = `election-${election.electionCode}-results.csv`;
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(csv);
+});
+
+export const exportResultsPdf = asyncHandler(async (req: Request, res: Response) => {
+  const election = await Election.findById(req.params.id);
+  if (!election) throw new AppError(404, 'Election not found');
+  if (election.status !== 'results_published') throw new AppError(400, 'Results must be published before exporting');
+
+  const tally    = await computeTally(election._id.toString());
+  const filename = `election-${election.electionCode}-results.pdf`;
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  await streamPdf(election, tally, res);
 });

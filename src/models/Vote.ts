@@ -21,10 +21,23 @@ const voteSchema = new Schema<IVote>(
     confirmationChoice: { type: String, enum: ['approve', 'reject'],     immutable: true },
     ballotToken:        { type: String, required: true,                  immutable: true },
     voteHash:           { type: String, required: true,                  immutable: true },
-    // Set explicitly via insertMany — immutable, no auto-management
-    createdAt:          { type: Date, required: true,                    immutable: true },
+    createdAt:          { type: Date,   required: true,                  immutable: true },
   },
   { timestamps: false, _id: true }
 );
+
+// Declared in-schema so the constraint is self-documenting and applied
+// on any fresh database even if createIndexes() is not run separately.
+// This is the primary idempotency guard — a duplicate (electionId, officeId,
+// ballotToken) triple will throw code 11000 and the catch block in
+// voting.service.ts handles it as VOTE_ALREADY_RECORDED.
+voteSchema.index(
+  { electionId: 1, officeId: 1, ballotToken: 1 },
+  { unique: true }
+);
+
+// Supporting indexes for results queries
+voteSchema.index({ electionId: 1 });
+voteSchema.index({ officeId:   1 });
 
 export default mongoose.model<IVote>('Vote', voteSchema);

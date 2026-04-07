@@ -1,7 +1,6 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-// z is used for semesterResetSchema (confirm literal) and createOfficerSchema / resetPasswordSchema
 import mongoose from 'mongoose';
 import User from '../models/User';
 import Avatar from '../models/Avatar';
@@ -19,6 +18,8 @@ import { sanitizeUser } from '../utils/sanitize';
 import { revokeAllUserTokens } from '../services/token.service';
 import { deleteImage } from '../services/upload.service';
 import { logAction } from '../services/audit.service';
+import { invalidateCachedUser } from '../services/userCache.service';
+import { redis } from '../config/redis';
 import {
   sendEmail,
   accountSuspendedTemplate,
@@ -26,8 +27,6 @@ import {
   passwordResetNotificationTemplate,
 } from '../services/email/email.service';
 import { AUDIT_ACTIONS } from '../config/constants';
-
-// ── Zod schemas ───────────────────────────────────────────────────────────────
 
 export const createOfficerSchema = z.object({
   email:    z.string().email(),
@@ -39,8 +38,6 @@ export const resetPasswordSchema = z.object({
   newPassword: z.string().min(8),
 });
 
-// ── Officers ──────────────────────────────────────────────────────────────────
-
 export const createOfficer = asyncHandler(async (req: Request, res: Response) => {
   const { email, fullName, password } = req.body as z.infer<typeof createOfficerSchema>;
   const normalised = email.toLowerCase();
@@ -48,7 +45,7 @@ export const createOfficer = asyncHandler(async (req: Request, res: Response) =>
   const existing = await User.findOne({ email: normalised });
   if (existing) throw new AppError(409, 'An account with this email already exists');
 
-  const passwordHash = await bcrypt.hash(password, 12);
+  const passwordHash = await bcrypt.hash(password, 10);
   const officer = await User.create({
     email: normalised, passwordHash, fullName,
     role: 'officer', profileCompleted: true, isActive: true, mustChangePassword: false,
@@ -63,8 +60,6 @@ export const createOfficer = asyncHandler(async (req: Request, res: Response) =>
   sendSuccess(res, sanitizeUser(officer), 'Officer created successfully', 201);
 });
 
-// ── User management ───────────────────────────────────────────────────────────
-
 export const listUsers = asyncHandler(async (req: Request, res: Response) => {
   const { role, status, search } = req.query as Record<string, string>;
   const pageNum  = Math.max(1, parseInt(req.query.page as string || '1', 10));
@@ -72,18 +67,12 @@ export const listUsers = asyncHandler(async (req: Request, res: Response) => {
   const skip     = (pageNum - 1) * limitNum;
 
   const filter: Record<string, unknown> = {};
-  if (role) filter.role = role;
+  if (role)                  { filter.role = role; }
   if (status === 'suspended')        { filter.isSuspended = true; }
   else if (status === 'deactivated') { filter.isActive = false; }
   else if (status === 'active')      { filter.isActive = true; filter.isSuspended = false; }
   if (search) {
-    // FIX (Issue 5): Escape all special regex metacharacters before interpolating
-    // into $regex. Without this, a crafted pattern like (a+)+ causes MongoDB to
-    // run a catastrophically backtracking scan (ReDoS). Length cap prevents
-    // excessively long patterns from consuming query-planning time.
-    const escaped = search
-      .slice(0, 100)
-      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escaped = search.slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     filter.$or = [
       { fullName: { $regex: escaped, $options: 'i' } },
       { email:    { $regex: escaped, $options: 'i' } },
@@ -110,7 +99,7 @@ export const suspendUser = asyncHandler(async (req: Request, res: Response) => {
   if (user.role === 'super_admin') throw new AppError(403, 'Cannot suspend a super admin');
 
   await User.findByIdAndUpdate(user._id, { $set: { isSuspended: true } });
-  await revokeAllUserTokens(user._id); // immediately invalidate all sessions
+  await revokeAllUserTokens(user._id);
 
   await logAction({
     action:      AUDIT_ACTIONS.ACCOUNT_SUSPENDED,
@@ -173,7 +162,7 @@ export const resetPassword = asyncHandler(async (req: Request, res: Response) =>
   const user = await User.findById(req.params.id);
   if (!user) throw new AppError(404, 'User not found');
 
-  const passwordHash = await bcrypt.hash(newPassword, 12);
+  const passwordHash = await bcrypt.hash(newPassword, 10);
   await User.findByIdAndUpdate(user._id, { $set: { passwordHash, mustChangePassword: true } });
 
   await logAction({
@@ -182,14 +171,11 @@ export const resetPassword = asyncHandler(async (req: Request, res: Response) =>
     targetId:    user._id,
     targetModel: 'User',
   });
-  // Password is intentionally NOT included in the notification email
   if (user.fullName) {
     await sendEmail({ to: user.email, ...passwordResetNotificationTemplate(user.fullName) }).catch(() => null);
   }
   sendSuccess(res, null, 'Password reset. User must change it on next login.');
 });
-
-// ── Dashboard — pure aggregation, no N+1 ─────────────────────────────────────
 
 export const getDashboard = asyncHandler(async (_req: Request, res: Response) => {
   const [totalAssociations, electionStats, voterStats, userStats] = await Promise.all([
@@ -206,12 +192,10 @@ export const getDashboard = asyncHandler(async (_req: Request, res: Response) =>
     ]),
   ]);
 
-  const electionsByStatus = Object.fromEntries(
-    electionStats.map((s) => [s._id ?? 'unknown', s.count])
-  );
-  const totalElections = electionStats.reduce((sum, s) => sum + s.count, 0);
-  const voterStat      = voterStats[0] ?? { total: 0, voted: 0 };
-  const userMap        = Object.fromEntries(userStats.map((u) => [u._id, u.count]));
+  const electionsByStatus = Object.fromEntries(electionStats.map((s) => [s._id ?? 'unknown', s.count]));
+  const totalElections    = electionStats.reduce((sum, s) => sum + s.count, 0);
+  const voterStat         = voterStats[0] ?? { total: 0, voted: 0 };
+  const userMap           = Object.fromEntries(userStats.map((u) => [u._id, u.count]));
 
   sendSuccess(res, {
     totalAssociations,
@@ -225,8 +209,6 @@ export const getDashboard = asyncHandler(async (_req: Request, res: Response) =>
     },
   });
 });
-
-// ── SA elections list ─────────────────────────────────────────────────────────
 
 export const listAllElections = asyncHandler(async (req: Request, res: Response) => {
   const { associationId, status, search } = req.query as Record<string, string>;
@@ -247,44 +229,25 @@ export const listAllElections = asyncHandler(async (req: Request, res: Response)
     Election.countDocuments(match),
   ]);
 
-  // FIX (Issue 12): Replace N+1 enrichment (up to 200 DB round-trips per page)
-  // with a single aggregation that fetches all voter counts for this page of
-  // elections in one query, then merges in application memory.
   const electionIds = elections.map((e) => e._id);
-
-  const voterAgg = await RegisteredVoter.aggregate<{
-    _id: string;
-    total: number;
-    voted: number;
-  }>([
+  const voterAgg = await RegisteredVoter.aggregate<{ _id: string; total: number; voted: number }>([
     { $match: { electionId: { $in: electionIds } } },
-    {
-      $group: {
-        _id:   '$electionId',
-        total: { $sum: 1 },
-        voted: { $sum: { $cond: ['$hasVoted', 1, 0] } },
-      },
-    },
+    { $group: { _id: '$electionId', total: { $sum: 1 }, voted: { $sum: { $cond: ['$hasVoted', 1, 0] } } } },
   ]);
 
   const voterMap = new Map(voterAgg.map((r) => [r._id.toString(), r]));
-
   const enriched = elections.map((e) => {
     const stats = voterMap.get(e._id.toString()) ?? { total: 0, voted: 0 };
     return {
       ...e.toObject(),
       registeredVoterCount: stats.total,
       votesCast:            stats.voted,
-      turnoutPercent:       stats.total > 0
-        ? Math.round((stats.voted / stats.total) * 100)
-        : 0,
+      turnoutPercent:       stats.total > 0 ? Math.round((stats.voted / stats.total) * 100) : 0,
     };
   });
 
   sendPaginated(res, enriched, total, pageNum, limitNum);
 });
-
-// ── Audit logs ────────────────────────────────────────────────────────────────
 
 export const getAuditLogs = asyncHandler(async (req: Request, res: Response) => {
   const { action, performedBy, targetModel, dateFrom, dateTo } = req.query as Record<string, string>;
@@ -314,26 +277,57 @@ export const getAuditLogs = asyncHandler(async (req: Request, res: Response) => 
   sendPaginated(res, logs, total, pageNum, limitNum);
 });
 
-// ── Semester reset ────────────────────────────────────────────────────────────
-// KEPT:    Association, Election, Office, Candidate, AssociationMember, AuditLog,
-//          all officer and SA accounts
-// DELETED: Vote, RegisteredVoter, OtpVerification, student RefreshTokens,
-//          student Avatars, student User accounts
+// ── Cache management (F-08) ───────────────────────────────────────────────────
 
 /**
- * GET  /api/super-admin/semester-reset/preview  — dry-run, returns counts only, no deletes
- * POST /api/super-admin/semester-reset           — execute; requires { confirm: "SEMESTER_RESET" }
- *
- * Design: always run the preview first so the SA can see exactly what will be deleted.
- * The execute step enforces a literal confirmation string as an extra safety gate.
- *
- * KEPT:    Association, Election, Office, Candidate, AssociationMember, AuditLog,
- *          all officer and SA accounts
- * DELETED: Vote, RegisteredVoter, OtpVerification, student RefreshTokens,
- *          student Avatars, student User accounts
+ * Clears the tally cache for a specific election.
+ * Useful when a manual vote correction has been applied and the cached
+ * result is stale. Both published and preview cache keys are cleared.
  */
+export const clearTallyCache = asyncHandler(async (req: Request, res: Response) => {
+  const { electionId } = req.params;
+  const [deleted, deletedPreview] = await Promise.all([
+    redis.del(`tally:${electionId}`),
+    redis.del(`tally:preview:${electionId}`),
+  ]);
+  sendSuccess(res, { deleted, deletedPreview }, 'Tally cache cleared');
+});
 
-// ── Dry-run preview (GET) ──────────────────────────────────────────────────────
+/**
+ * Evicts a specific user from the Redis user cache.
+ * Use after a manual role or suspension change applied directly to MongoDB
+ * to ensure the next request picks up the fresh document.
+ */
+export const clearUserCache = asyncHandler(async (req: Request, res: Response) => {
+  const { userId } = req.params;
+  await invalidateCachedUser(userId);
+  sendSuccess(res, null, 'User cache cleared');
+});
+
+/**
+ * Returns Redis server info for operational monitoring.
+ * Useful for inspecting memory usage, connected clients, and hit/miss rates.
+ */
+export const getCacheStats = asyncHandler(async (_req: Request, res: Response) => {
+  const info = await redis.info();
+  const lines = info.split('\r\n');
+  const stats: Record<string, string> = {};
+  for (const line of lines) {
+    const [key, value] = line.split(':');
+    if (key && value !== undefined) stats[key.trim()] = value.trim();
+  }
+  const relevant = {
+    used_memory_human:        stats['used_memory_human'],
+    connected_clients:        stats['connected_clients'],
+    keyspace_hits:            stats['keyspace_hits'],
+    keyspace_misses:          stats['keyspace_misses'],
+    total_commands_processed: stats['total_commands_processed'],
+    uptime_in_seconds:        stats['uptime_in_seconds'],
+  };
+  sendSuccess(res, relevant, 'Redis cache stats');
+});
+
+// ── Semester reset ────────────────────────────────────────────────────────────
 
 export const semesterResetPreview = asyncHandler(async (_req: Request, res: Response) => {
   const studentIds = await User.find({ role: 'student' }).distinct('_id');
@@ -348,19 +342,17 @@ export const semesterResetPreview = asyncHandler(async (_req: Request, res: Resp
   ]);
 
   sendSuccess(res, {
-    preview: true,
+    preview:    true,
     willDelete: { votes, voters, otps, tokens, avatars, students },
     willKeep:   {
-      associations:        await Association.countDocuments(),
-      elections:           await Election.countDocuments(),
-      officersAndAdmins:   await User.countDocuments({ role: { $in: ['officer', 'super_admin'] } }),
-      auditLogs:           await AuditLog.countDocuments(),
+      associations:      await Association.countDocuments(),
+      elections:         await Election.countDocuments(),
+      officersAndAdmins: await User.countDocuments({ role: { $in: ['officer', 'super_admin'] } }),
+      auditLogs:         await AuditLog.countDocuments(),
     },
     instructions: 'POST to /semester-reset with { "confirm": "SEMESTER_RESET" } to execute.',
   }, 'Semester reset preview — no data has been changed');
 });
-
-// ── Execute (POST) ─────────────────────────────────────────────────────────────
 
 export const semesterResetSchema = z.object({
   confirm: z.literal('SEMESTER_RESET', {
@@ -369,40 +361,24 @@ export const semesterResetSchema = z.object({
 });
 
 export const semesterReset = asyncHandler(async (req: Request, res: Response) => {
-  // Zod validation enforces the confirmation string — if it is missing or wrong, Zod
-  // rejects the request before we reach this handler (validate() middleware applied in route).
-  // We re-parse here as an extra safeguard in case the route is called without the middleware.
   const parsed = semesterResetSchema.safeParse(req.body);
   if (!parsed.success) {
     throw new AppError(400, parsed.error.errors[0].message, 'CONFIRM_REQUIRED');
   }
 
-  // ── Step 0: Write initiation log BEFORE any destructive operation ─────────
   await logAction({
     action:      AUDIT_ACTIONS.SEMESTER_RESET_INITIATED,
     performedBy: req.user._id,
     metadata:    { initiatedAt: new Date().toISOString() },
   });
 
-  // ── Step 1: Votes ─────────────────────────────────────────────────────────
-  const deletedVotes = (await Vote.deleteMany({})).deletedCount;
-  await logAction({
-    action:      AUDIT_ACTIONS.SEMESTER_RESET_INITIATED,   // reuse existing action as step-log
-    performedBy: req.user._id,
-    metadata:    { step: 'votes_deleted', deletedVotes },
-  });
-
-  // ── Step 2: Registered voters ─────────────────────────────────────────────
+  const deletedVotes  = (await Vote.deleteMany({})).deletedCount;
   const deletedVoters = (await RegisteredVoter.deleteMany({})).deletedCount;
+  const deletedOtps   = (await OtpVerification.deleteMany({})).deletedCount;
 
-  // ── Step 3: Pending OTPs ──────────────────────────────────────────────────
-  const deletedOtps = (await OtpVerification.deleteMany({})).deletedCount;
-
-  // ── Step 4: Student refresh tokens ───────────────────────────────────────
   const studentIds    = await User.find({ role: 'student' }).distinct('_id');
   const deletedTokens = (await RefreshToken.deleteMany({ userId: { $in: studentIds } })).deletedCount;
 
-  // ── Step 5: Cloudinary avatars — best-effort; failures logged, not fatal ─
   const avatars = await Avatar.find({ userId: { $in: studentIds } });
   let avatarFailures = 0;
   for (const avatar of avatars) {
@@ -415,10 +391,8 @@ export const semesterReset = asyncHandler(async (req: Request, res: Response) =>
   }
   await Avatar.deleteMany({ userId: { $in: studentIds } });
 
-  // ── Step 6: Student accounts ──────────────────────────────────────────────
   const deletedStudents = (await User.deleteMany({ role: 'student' })).deletedCount;
 
-  // ── Step 7: Reset elections to draft for the next semester ────────────────
   await Election.updateMany({}, {
     $set: {
       status:            'draft',
@@ -430,7 +404,6 @@ export const semesterReset = asyncHandler(async (req: Request, res: Response) =>
     },
   });
 
-  // ── Step 8: Completion log ────────────────────────────────────────────────
   const counts = { deletedVotes, deletedVoters, deletedStudents, deletedOtps, deletedTokens, avatarFailures };
   await logAction({
     action:      AUDIT_ACTIONS.SEMESTER_RESET_COMPLETED,

@@ -2,7 +2,8 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env';
 import { AppError } from '../utils/AppError';
-import User from '../models/User';
+import User, { IUser } from '../models/User';
+import { getCachedUser, setCachedUser } from '../services/userCache.service';
 
 export async function authenticate(
   req: Request,
@@ -17,18 +18,23 @@ export async function authenticate(
 
     const token = authHeader.split(' ')[1];
 
-    // FIX (Issue 8): Payload only contains userId — role is NOT in the JWT.
-    // This eliminates the window where a demoted user's old token still carries
-    // their elevated role. Role is always read live from the database below.
+    // Only userId in payload — role is always read live (from cache or DB)
     const payload = jwt.verify(token, env.JWT_ACCESS_SECRET) as { userId: string };
 
-    const user = await User.findById(payload.userId);
-    if (!user) return next(new AppError(401, 'User not found'));
-    if (!user.isActive)   return next(new AppError(403, 'Account deactivated'));
-    if (user.isSuspended) return next(new AppError(403, 'Account suspended'));
+    // 1. Try Redis cache first
+   let user = await getCachedUser(payload.userId);
 
-    // req.user.role is always the live DB value — never the JWT claim
-    req.user = user;
+if (!user) {
+  const dbUser = await User.findById(payload.userId).lean<IUser>();
+  if (!dbUser) return next(new AppError(401, 'User not found'));
+  await setCachedUser(dbUser);
+  user = dbUser;
+}
+
+    if (!user!.isActive)   return next(new AppError(403, 'Account deactivated'));
+    if (user!.isSuspended) return next(new AppError(403, 'Account suspended'));
+
+    req.user = user!;
     next();
   } catch (err) {
     if (err instanceof AppError) return next(err);

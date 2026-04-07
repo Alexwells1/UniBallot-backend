@@ -56,7 +56,7 @@ async function seed(): Promise<void> {
     return;
   }
 
-  const passwordHash = await bcrypt.hash(PASSWORD!, 12);
+  const passwordHash = await bcrypt.hash(PASSWORD!, 10);
   await User.create({
     email:              EMAIL!.toLowerCase(),
     passwordHash,

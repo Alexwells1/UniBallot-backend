@@ -26,7 +26,7 @@ router.post('/resend-otp',  otpLimiter,          validate(resendOtpSchema),   re
 // GET — query param validation uses 'query' source
 router.get('/otp-status',   otpLimiter,          validate(otpStatusSchema, 'query'), otpStatus);
 
-router.post('/login',       loginLimiter,         validate(loginSchema),       login);
+router.post('/login',    loginLimiter,           validate(loginSchema),       login);
 router.post('/refresh',     refreshLimiter,  validate(refreshSchema),  refresh);
 router.post('/logout',      authenticate,                                      logout);
 

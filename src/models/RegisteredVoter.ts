@@ -19,5 +19,10 @@ const registeredVoterSchema = new Schema<IRegisteredVoter>({
   votedAt:     { type: Date },
 });
 
-// Compound index defined in database.ts
+// Primary double-vote guard — must be unique
+registeredVoterSchema.index({ electionId: 1, userId: 1 }, { unique: true });
+
+// Added: receipt lookup index for verifyReceipt — was doing a collection scan
+registeredVoterSchema.index({ electionId: 1, receiptCode: 1 });
+
 export default mongoose.model<IRegisteredVoter>('RegisteredVoter', registeredVoterSchema);

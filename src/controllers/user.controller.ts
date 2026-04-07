@@ -11,12 +11,19 @@ import { uploadImage, deleteImage } from '../services/upload.service';
 import { logAction } from '../services/audit.service';
 import { AUDIT_ACTIONS, CLOUDINARY_FOLDERS, MATRIC_NUMBER_REGEX } from '../config/constants';
 
-// ── Zod schemas ───────────────────────────────────────────────────────────────
-
 export const profileSchema = z.object({
   fullName:     z.string().min(2, 'Full name must be at least 2 characters'),
   matricNumber: z.string().regex(MATRIC_NUMBER_REGEX, 'Invalid matric number format'),
   gender:       z.enum(['male', 'female', 'other']).optional(),
+});
+
+/**
+ * Schema for subsequent profile updates (PATCH).
+ * matricNumber is intentionally excluded — it is immutable after first completion.
+ */
+export const updateProfileSchema = z.object({
+  fullName: z.string().min(2, 'Full name must be at least 2 characters').optional(),
+  gender:   z.enum(['male', 'female', 'other']).optional(),
 });
 
 export const passwordChangeSchema = z.object({
@@ -24,16 +31,14 @@ export const passwordChangeSchema = z.object({
   newPassword:     z.string().min(8, 'New password must be at least 8 characters'),
 });
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
-
 export const getMe = asyncHandler(async (req: Request, res: Response) => {
   sendSuccess(res, sanitizeUser(req.user), 'Profile retrieved');
 });
 
 /**
- * PUT /api/users/me/profile — student only, one-time.
- * Matric format is validated here; eligibility against a membership list
- * is only checked at election registration time.
+ * First-time profile completion (PUT).
+ * Sets matricNumber and marks profileCompleted = true.
+ * Subsequent edits must use PATCH /me/profile (updateProfile).
  */
 export const completeProfile = asyncHandler(async (req: Request, res: Response) => {
   if (req.user.profileCompleted) throw new AppError(409, 'Profile already completed');
@@ -61,16 +66,36 @@ export const completeProfile = asyncHandler(async (req: Request, res: Response) 
 });
 
 /**
- * POST /api/users/me/avatar — all roles.
- * Deletes existing Cloudinary asset before uploading the new one.
+ * Updates fullName and/or gender for users who have already completed their profile.
+ * matricNumber is read-only after initial completion and is silently ignored.
  */
+export const updateProfile = asyncHandler(async (req: Request, res: Response) => {
+  const { fullName, gender } = req.body as z.infer<typeof updateProfileSchema>;
+
+  const fields: Record<string, unknown> = {};
+  if (fullName !== undefined) fields.fullName = fullName;
+  if (gender !== undefined)   fields.gender   = gender;
+
+  if (Object.keys(fields).length === 0) {
+    throw new AppError(400, 'No updatable fields provided');
+  }
+
+  const updated = await User.findByIdAndUpdate(
+    req.user._id,
+    { $set: fields },
+    { new: true, runValidators: true }
+  );
+  if (!updated) throw new AppError(404, 'User not found');
+
+  sendSuccess(res, sanitizeUser(updated), 'Profile updated');
+});
+
 export const uploadAvatarHandler = asyncHandler(async (req: Request, res: Response) => {
   if (!req.file) throw new AppError(400, 'No image file provided (form field name: "avatar")');
 
-  // Delete old avatar if it exists
   const existing = await Avatar.findOne({ userId: req.user._id });
   if (existing) {
-    await deleteImage(existing.publicId).catch(() => null); // best-effort
+    await deleteImage(existing.publicId).catch(() => null);
     await Avatar.deleteOne({ userId: req.user._id });
   }
 
@@ -86,10 +111,6 @@ export const uploadAvatarHandler = asyncHandler(async (req: Request, res: Respon
   sendSuccess(res, { avatarUrl: url }, 'Avatar uploaded successfully');
 });
 
-/**
- * PUT /api/users/me/password — all roles.
- * When mustChangePassword is true, currentPassword check is skipped.
- */
 export const changePassword = asyncHandler(async (req: Request, res: Response) => {
   const { currentPassword, newPassword } = req.body as z.infer<typeof passwordChangeSchema>;
 
@@ -99,7 +120,7 @@ export const changePassword = asyncHandler(async (req: Request, res: Response) =
     if (!valid) throw new AppError(400, 'Current password is incorrect');
   }
 
-  const passwordHash = await bcrypt.hash(newPassword, 12);
+  const passwordHash = await bcrypt.hash(newPassword, 10);
   await User.findByIdAndUpdate(req.user._id, {
     $set: { passwordHash, mustChangePassword: false },
   });

@@ -26,10 +26,14 @@
     "morgan": "^1.10.1",
     "multer": "^1.4.5-lts.1",
     "node-fetch": "^3.3.2",
+    "rate-limit-redis": "^4.3.1",
+    "redis": "^4.7.1",
     "resend": "^3.2.0",
     "streamifier": "^0.1.1",
     "uuid": "^13.0.0",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "csv-stringify": "^6.5.1",
+    "pdfkit": "^0.15.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
@@ -43,6 +47,7 @@
     "@types/uuid": "^10.0.0",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
-    "typescript": "^5.4.5"
+    "typescript": "^5.4.5",
+    "@types/pdfkit": "^0.13.5"
   }
 }
