@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken';
 import { env } from '../config/env';
 import { AppError } from '../utils/AppError';
 import User, { IUser } from '../models/User';
-import { getCachedUser, setCachedUser } from '../services/userCache.service';
+import { getCachedUser, setCachedUser, CachedUser } from '../services/userCache.service';
 
 export async function authenticate(
   req: Request,
@@ -22,19 +22,21 @@ export async function authenticate(
     const payload = jwt.verify(token, env.JWT_ACCESS_SECRET) as { userId: string };
 
     // 1. Try Redis cache first
-   let user = await getCachedUser(payload.userId);
+    let user: IUser | CachedUser | null = await getCachedUser(payload.userId);
 
-if (!user) {
-  const dbUser = await User.findById(payload.userId).lean<IUser>();
-  if (!dbUser) return next(new AppError(401, 'User not found'));
-  await setCachedUser(dbUser);
-  user = dbUser;
-}
+    if (!user) {
+      const dbUser = await User.findById(payload.userId).lean<IUser>();
+      if (!dbUser) return next(new AppError(401, 'User not found'));
+      await setCachedUser(dbUser);
+      user = dbUser;
+    }
 
-    if (!user!.isActive)   return next(new AppError(403, 'Account deactivated'));
-    if (user!.isSuspended) return next(new AppError(403, 'Account suspended'));
+    if (!user.isActive)   return next(new AppError(403, 'Account deactivated'));
+    if (user.isSuspended) return next(new AppError(403, 'Account suspended'));
 
-    req.user = user!;
+    // passwordHash is stripped in CachedUser — cast is safe because all
+    // fields required by downstream handlers are present on both types.
+    req.user = user as IUser;
     next();
   } catch (err) {
     if (err instanceof AppError) return next(err);

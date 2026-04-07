@@ -64,13 +64,13 @@ function makeLimiter(
   };
 }
 
-export const registrationLimiter = makeLimiter('rl:reg:',     10, 'Too many registration attempts, please try again later');
-export const loginLimiter         = makeLimiter('rl:login:',   100000, 'Too many login attempts, please try again later');
-export const otpLimiter           = makeLimiter('rl:otp:',      5, 'Too many OTP attempts, please try again later');
-export const votingLimiter        = makeLimiter('rl:vote:',     50000, 'Too many voting requests, please try again later');
-export const refreshLimiter       = makeLimiter('rl:refresh:', 20, 'Too many token refresh attempts');
-export const generalLimiter       = makeLimiter('rl:general:', 1000000, 'Too many requests, please slow down');
-export const receiptLimiter       = makeLimiter('rl:receipt:', 10, 'Too many receipt verification attempts, please try again later');
+export const registrationLimiter = makeLimiter('rl:reg:',     10,  'Too many registration attempts, please try again later');
+export const loginLimiter         = makeLimiter('rl:login:',   10,  'Too many login attempts, please try again later');
+export const otpLimiter           = makeLimiter('rl:otp:',      5,  'Too many OTP attempts, please try again later');
+export const votingLimiter        = makeLimiter('rl:vote:',     5,  'Too many voting requests, please try again later');
+export const refreshLimiter       = makeLimiter('rl:refresh:', 20,  'Too many token refresh attempts');
+export const generalLimiter       = makeLimiter('rl:general:', 200, 'Too many requests, please slow down');
+export const receiptLimiter       = makeLimiter('rl:receipt:', 10,  'Too many receipt verification attempts, please try again later');
 
 /**
  * F-11: Election code lookups are unauthenticated and short-code brute-forceable.

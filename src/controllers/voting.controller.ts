@@ -73,7 +73,7 @@ export const integrityCheck = asyncHandler(async (req: Request, res: Response) =
     requestedBy: req.user._id.toString(),
   });
 
-  sendSuccess(res, {
+  return sendSuccess(res, {
     jobId:   job.id,
     status:  'queued',
     message: 'Poll GET /:id/integrity-result/:jobId for the result.',
@@ -98,7 +98,7 @@ export const getIntegrityResult = asyncHandler(async (req: Request, res: Respons
   }
 
   const progress = job.progress;
-  sendSuccess(res, {
+  return sendSuccess(res, {
     status:   state,
     progress: typeof progress === 'number' ? progress : null,
     message:  'Still running — try again in a few seconds.',

@@ -332,11 +332,7 @@ export const publishResults = asyncHandler(async (req: Request, res: Response) =
   sendSuccess(res, { hasTies, tiedOffices }, 'Results published');
 });
 
-/**
- * Returns published results for registered voters and admins.
- * For results_published elections, serves stored results directly from the
- * Election document without recomputing, then falls back to cached tally.
- */
+
 export const getResults = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');
@@ -356,7 +352,7 @@ export const getResults = asyncHandler(async (req: Request, res: Response) => {
 
   const tally = await computeTally(election._id.toString());
   await redis.setEx(`tally:${election._id}`, 3_600, JSON.stringify(tally)).catch(() => null);
-  sendSuccess(res, tally);
+  return sendSuccess(res, tally);
 });
 
 export const getResultsByCode = asyncHandler(async (req: Request, res: Response) => {
@@ -372,11 +368,7 @@ export const getResultsByCode = asyncHandler(async (req: Request, res: Response)
   sendSuccess(res, election.results || []);
 });
 
-/**
- * Live preview for officers and super admins after voting closes.
- * Results are cached for 60 seconds (tally:preview prefix) to avoid
- * repeated full Vote aggregations when admins refresh rapidly.
- */
+
 export const previewResults = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');
@@ -390,7 +382,7 @@ export const previewResults = asyncHandler(async (req: Request, res: Response) =
 
   const tally = await computeTally(election._id.toString());
   await redis.setEx(previewKey, 60, JSON.stringify(tally)).catch(() => null);
-  sendSuccess(res, tally, 'Live preview');
+  return sendSuccess(res, tally, 'Live preview');
 });
 
 export const getAnalytics = asyncHandler(async (req: Request, res: Response) => {
