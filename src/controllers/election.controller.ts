@@ -20,6 +20,9 @@ import { redis } from '../config/redis';
 import { generateCsv, streamPdf } from '../services/export.service';
 import type { IElection } from '../models/Election';
 
+// H-08: Max concurrent elections per officer
+const MAX_OFFICER_CONCURRENT_ELECTIONS = parseInt(process.env.MAX_OFFICER_CONCURRENT_ELECTIONS || '3', 10);
+
 export const createElectionSchema = z.object({
   associationId: z.string().min(1, 'associationId is required'),
   title:         z.string().min(2),
@@ -67,8 +70,9 @@ export const listElections = asyncHandler(async (req: Request, res: Response) =>
   if (associationId) filter.associationId = new mongoose.Types.ObjectId(associationId);
   if (status) filter.status = status;
   if (search) {
+    // H-11: Use anchored regex (^) for search filtering
     const escaped = (search as string).slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    filter.title = { $regex: escaped, $options: 'i' };
+    filter.title = { $regex: '^' + escaped, $options: 'i' };
   }
 
   const [elections, total] = await Promise.all([
@@ -152,12 +156,15 @@ export const assignOfficer = asyncHandler(async (req: Request, res: Response) =>
   if (!officer || officer.role !== 'officer') throw new AppError(400, 'User is not an officer');
   if (!officer.isActive || officer.isSuspended) throw new AppError(400, 'Officer account is not active');
 
-  const alreadyAssigned = await Election.findOne({
+  // H-08: Check officer concurrent election limit
+  const activeCount = await Election.countDocuments({
     assignedOfficerId: officerId,
     _id: { $ne: election._id },
     status: { $ne: 'results_published' },
   });
-  if (alreadyAssigned) throw new AppError(409, 'Officer is already assigned to another active election');
+  if (activeCount >= MAX_OFFICER_CONCURRENT_ELECTIONS) {
+    throw new AppError(409, `Officer is already assigned to ${activeCount} active election(s) (max: ${MAX_OFFICER_CONCURRENT_ELECTIONS})`);
+  }
 
   await Election.findByIdAndUpdate(election._id, { $set: { assignedOfficerId: officerId } });
   await logAction({
@@ -186,22 +193,31 @@ export const transitionStatus = asyncHandler(async (req: Request, res: Response)
   const currentIdx = ELECTION_STATUS_ORDER.indexOf(election.status);
   const newIdx     = ELECTION_STATUS_ORDER.indexOf(typedStatus);
 
-  if (req.user.role !== 'super_admin' && newIdx !== currentIdx + 1) {
-    throw new AppError(400, 'Officers may only advance to the immediate next status');
-  }
-
-  if (typedStatus === 'registration_open') {
-    const memberCount = await AssociationMember.countDocuments({ electionId: election._id });
-    if (memberCount === 0) throw new AppError(400, 'Upload at least one member before opening registration');
-  }
-
-  if (typedStatus === 'voting_open') {
-    const offices = await Office.find({ electionId: election._id });
-    if (offices.length === 0) throw new AppError(400, 'At least one office is required');
-    for (const office of offices) {
-      const count = await Candidate.countDocuments({ officeId: office._id });
-      if (count === 0) throw new AppError(400, `Office "${office.title}" has no candidates`);
+  // C-02: Allow backward one step + forward one step (both with validations) for all roles
+  if (newIdx === currentIdx - 1) {
+    // Backward transition — allowed with pre-condition checks
+    if (typedStatus === 'registration_open') {
+      const memberCount = await AssociationMember.countDocuments({ electionId: election._id });
+      if (memberCount === 0) throw new AppError(400, 'Cannot go back to registration_open: no members uploaded');
     }
+  } else if (newIdx === currentIdx + 1) {
+    // Forward transition — standard pre-condition checks
+    if (typedStatus === 'registration_open') {
+      const memberCount = await AssociationMember.countDocuments({ electionId: election._id });
+      if (memberCount === 0) throw new AppError(400, 'Upload at least one member before opening registration');
+    }
+
+    if (typedStatus === 'voting_open') {
+      const offices = await Office.find({ electionId: election._id });
+      if (offices.length === 0) throw new AppError(400, 'At least one office is required');
+      for (const office of offices) {
+        const count = await Candidate.countDocuments({ officeId: office._id });
+        if (count === 0) throw new AppError(400, `Office "${office.title}" has no candidates`);
+      }
+    }
+  } else {
+    // Neither one step backward nor one step forward
+    throw new AppError(400, 'Status transitions are only allowed one step forward or one step backward');
   }
 
   if (typedStatus === 'results_published') {
@@ -301,9 +317,15 @@ export const publishResults = asyncHandler(async (req: Request, res: Response) =
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');
 
+  // C-07: Pre-check election status = 'voting_closed' BEFORE computation
+  if (election.status !== 'voting_closed') {
+    throw new AppError(400, 'Election is not in voting_closed status');
+  }
+
   const tally = await computeTally(election._id.toString());
   if (!tally || tally.length === 0) throw new AppError(400, 'No votes found for this election');
 
+  // C-07: Atomic update with status check — 409 if status changed
   const updated = await Election.findOneAndUpdate(
     { _id: election._id, status: 'voting_closed' },
     { $set: { results: tally, status: 'results_published' } },
@@ -313,7 +335,7 @@ export const publishResults = asyncHandler(async (req: Request, res: Response) =
   if (!updated) {
     const current = await Election.findById(election._id).select('status');
     if (current?.status === 'results_published') throw new AppError(409, 'Results have already been published');
-    throw new AppError(400, 'Election is not in voting_closed status');
+    throw new AppError(409, 'Election status changed during computation — please retry');
   }
 
   const cacheKey = `tally:${election._id}`;
@@ -484,34 +506,53 @@ export const deleteElection = asyncHandler(async (req: Request, res: Response) =
     }
   }
 
-  await Vote.deleteMany({ electionId: election._id });
-  await RegisteredVoter.deleteMany({ electionId: election._id });
+  // C-03: Wrap ALL deletion operations in MongoDB transaction
+  const session = await mongoose.startSession();
+  try {
+    session.startTransaction({
+      readConcern:    { level: 'snapshot' },
+      writeConcern:   { w: 'majority' },
+      maxCommitTimeMS: 30_000,
+    });
 
-  const candidates = await Candidate.find({ electionId: election._id }, { photoPublicId: 1 });
-  const { deleteImage } = await import('../services/upload.service');
-  let photoFailures = 0;
-  for (const candidate of candidates) {
-    if (candidate.photoPublicId) {
-      try {
-        await deleteImage(candidate.photoPublicId);
-      } catch {
-        photoFailures++;
+    await Vote.deleteMany({ electionId: election._id }, { session });
+    await RegisteredVoter.deleteMany({ electionId: election._id }, { session });
+
+    const candidates = await Candidate.find({ electionId: election._id }, { photoPublicId: 1 }).session(session);
+
+    await Candidate.deleteMany({ electionId: election._id }, { session });
+    await Office.deleteMany({ electionId: election._id }, { session });
+    await AssociationMember.deleteMany({ electionId: election._id }, { session });
+    await Election.findByIdAndDelete(election._id, { session });
+
+    await session.commitTransaction();
+
+    // C-03: Cleanup Cloudinary after successful transaction
+    const { deleteImage } = await import('../services/upload.service');
+    let photoFailures = 0;
+    for (const candidate of candidates) {
+      if (candidate.photoPublicId) {
+        try {
+          await deleteImage(candidate.photoPublicId);
+        } catch {
+          photoFailures++;
+        }
       }
     }
+
+    await logAction({
+      action:      AUDIT_ACTIONS.ELECTION_DELETED,
+      performedBy: req.user._id,
+      targetId:    election._id,
+      targetModel: 'Election',
+      metadata:    { title: election.title, deletedStatus: election.status, forced: election.status !== 'draft', photoFailures },
+    });
+  } catch (err) {
+    await session.abortTransaction().catch(() => null);
+    throw err;
+  } finally {
+    session.endSession();
   }
-
-  await Candidate.deleteMany({ electionId: election._id });
-  await Office.deleteMany({ electionId: election._id });
-  await AssociationMember.deleteMany({ electionId: election._id });
-  await Election.findByIdAndDelete(election._id);
-
-  await logAction({
-    action:      AUDIT_ACTIONS.ELECTION_DELETED,
-    performedBy: req.user._id,
-    targetId:    election._id,
-    targetModel: 'Election',
-    metadata:    { title: election.title, deletedStatus: election.status, forced: election.status !== 'draft', photoFailures },
-  });
 
   res.status(204).send();
 });

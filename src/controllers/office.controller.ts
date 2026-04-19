@@ -19,12 +19,18 @@ export const officeSchema = z.object({
 export const createOffice = asyncHandler(async (req: Request, res: Response) => {
   const election = await Election.findById(req.params.id);
   if (!election) throw new AppError(404, 'Election not found');
-  if (!['setup', 'registration_open', 'registration_closed'].includes(election.status)) {
-    throw new AppError(400, 'Offices can only be created in setup, registration_open, or registration_closed status');
+  // C-01: Only allow setup and registration_open (removed registration_closed)
+  if (!['setup', 'registration_open'].includes(election.status)) {
+    throw new AppError(400, 'Offices can only be created in setup or registration_open status');
   }
   if (election.candidatesLocked) throw new AppError(409, 'Candidates are locked');
 
   const { title, description } = req.body as z.infer<typeof officeSchema>;
+
+  // H-03: Check for duplicate office title within the same election
+  const existingOffice = await Office.findOne({ electionId: election._id, title: title.trim() });
+  if (existingOffice) throw new AppError(409, 'An office with this title already exists in the election');
+
   const office = await Office.create({ electionId: election._id, title, description });
 
   await logAction({

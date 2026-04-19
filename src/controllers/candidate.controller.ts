@@ -3,6 +3,7 @@ import { z } from 'zod';
 import Candidate from '../models/Candidate';
 import Office from '../models/Office';
 import Election from '../models/Election';
+import Vote from '../models/Vote';
 import { AppError } from '../utils/AppError';
 import { asyncHandler } from '../utils/asyncHandler';
 import { sendSuccess } from '../utils/apiResponse';
@@ -109,6 +110,10 @@ export const deleteCandidate = asyncHandler(async (req: Request, res: Response) 
   const election = await Election.findById(candidate.electionId);
   if (!election) throw new AppError(404, 'Election not found');
   if (election.candidatesLocked) throw new AppError(409, 'Candidates are locked');
+
+  // H-02: Check if votes exist for this candidate before deletion
+  const voteExists = await Vote.findOne({ candidateId: candidate._id });
+  if (voteExists) throw new AppError(409, 'Cannot delete a candidate that has votes');
 
   // Guard: at least one candidate must remain per office
   const remainingCount = await Candidate.countDocuments({ officeId: candidate.officeId });

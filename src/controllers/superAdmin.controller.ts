@@ -219,7 +219,7 @@ export const listAllElections = asyncHandler(async (req: Request, res: Response)
   const match: Record<string, unknown> = {};
   if (associationId) match.associationId = new mongoose.Types.ObjectId(associationId);
   if (status)        match.status        = status;
-  if (search)        match.title         = { $regex: search.slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+  if (search)        match.title         = { $regex: '^' + search.slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
 
   const [elections, total] = await Promise.all([
     Election.find(match)
@@ -366,50 +366,103 @@ export const semesterReset = asyncHandler(async (req: Request, res: Response) =>
     throw new AppError(400, parsed.error.errors[0].message, 'CONFIRM_REQUIRED');
   }
 
-  await logAction({
-    action:      AUDIT_ACTIONS.SEMESTER_RESET_INITIATED,
-    performedBy: req.user._id,
-    metadata:    { initiatedAt: new Date().toISOString() },
-  });
-
-  const deletedVotes  = (await Vote.deleteMany({})).deletedCount;
-  const deletedVoters = (await RegisteredVoter.deleteMany({})).deletedCount;
-  const deletedOtps   = (await OtpVerification.deleteMany({})).deletedCount;
-
-  const studentIds    = await User.find({ role: 'student' }).distinct('_id');
-  const deletedTokens = (await RefreshToken.deleteMany({ userId: { $in: studentIds } })).deletedCount;
-
-  const avatars = await Avatar.find({ userId: { $in: studentIds } });
-  let avatarFailures = 0;
-  for (const avatar of avatars) {
-    try {
-      await deleteImage(avatar.publicId);
-    } catch (e) {
-      avatarFailures++;
-      console.error('Avatar Cloudinary delete failed:', e);
-    }
+  // C-04: Add Redis distributed lock (5 min timeout)
+  const lockKey = 'lock:semester-reset';
+  const lockTtl = 300; // 5 minutes
+  const lockAcquired = await redis.set(lockKey, '1', { NX: true, EX: lockTtl });
+  if (!lockAcquired) {
+    throw new AppError(409, 'A semester reset is already in progress. Please try again later.');
   }
-  await Avatar.deleteMany({ userId: { $in: studentIds } });
 
-  const deletedStudents = (await User.deleteMany({ role: 'student' })).deletedCount;
+  try {
+    await logAction({
+      action:      AUDIT_ACTIONS.SEMESTER_RESET_INITIATED,
+      performedBy: req.user._id,
+      metadata:    { initiatedAt: new Date().toISOString() },
+    });
 
-  await Election.updateMany({}, {
-    $set: {
-      status:            'draft',
-      candidatesLocked:  false,
-      membersLocked:     false,
-      isLocked:          false,
-      results:           null,
-      assignedOfficerId: null,
-    },
-  });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
 
-  const counts = { deletedVotes, deletedVoters, deletedStudents, deletedOtps, deletedTokens, avatarFailures };
-  await logAction({
-    action:      AUDIT_ACTIONS.SEMESTER_RESET_COMPLETED,
-    performedBy: req.user._id,
-    metadata:    counts,
-  });
+    // C-04: Archive collections with timestamp BEFORE deletion + MongoDB transaction
+    const session = await mongoose.startSession();
+    let counts: Record<string, number> = {};
+    let avatarFailures = 0;
 
-  sendSuccess(res, counts, 'Semester reset completed');
+    try {
+      session.startTransaction({
+        readConcern:    { level: 'snapshot' },
+        writeConcern:   { w: 'majority' },
+        maxCommitTimeMS: 60_000,
+      });
+
+      // Archive votes before deletion
+      const votesToArchive = await Vote.find({}).lean().session(session);
+      if (votesToArchive.length > 0) {
+        const archiveVoteCollection = mongoose.connection.collection(`archive_votes_${timestamp}`);
+        await archiveVoteCollection.insertMany(votesToArchive);
+      }
+
+      // Archive registered voters before deletion
+      const votersToArchive = await RegisteredVoter.find({}).lean().session(session);
+      if (votersToArchive.length > 0) {
+        const archiveVoterCollection = mongoose.connection.collection(`archive_registeredvoters_${timestamp}`);
+        await archiveVoterCollection.insertMany(votersToArchive);
+      }
+
+      const deletedVotes  = (await Vote.deleteMany({}, { session })).deletedCount;
+      const deletedVoters = (await RegisteredVoter.deleteMany({}, { session })).deletedCount;
+      const deletedOtps   = (await OtpVerification.deleteMany({}, { session })).deletedCount;
+
+      const studentIds    = await User.find({ role: 'student' }).distinct('_id').session(session);
+      const deletedTokens = (await RefreshToken.deleteMany({ userId: { $in: studentIds } }, { session })).deletedCount;
+
+      const avatars = await Avatar.find({ userId: { $in: studentIds } }).session(session);
+      await Avatar.deleteMany({ userId: { $in: studentIds } }, { session });
+
+      const deletedStudents = (await User.deleteMany({ role: 'student' }, { session })).deletedCount;
+
+      // C-04: Reset elections to draft status
+      await Election.updateMany({}, {
+        $set: {
+          status:            'draft',
+          candidatesLocked:  false,
+          membersLocked:     false,
+          isLocked:          false,
+          results:           null,
+          assignedOfficerId: null,
+        },
+      }, { session });
+
+      await session.commitTransaction();
+
+      counts = { deletedVotes, deletedVoters, deletedStudents, deletedOtps, deletedTokens, avatarFailures: 0 };
+
+      // Cleanup Cloudinary after successful transaction
+      for (const avatar of avatars) {
+        try {
+          await deleteImage(avatar.publicId);
+        } catch (e) {
+          avatarFailures++;
+          console.error('Avatar Cloudinary delete failed:', e);
+        }
+      }
+      counts.avatarFailures = avatarFailures;
+    } catch (err) {
+      await session.abortTransaction().catch(() => null);
+      throw err;
+    } finally {
+      session.endSession();
+    }
+
+    await logAction({
+      action:      AUDIT_ACTIONS.SEMESTER_RESET_COMPLETED,
+      performedBy: req.user._id,
+      metadata:    counts,
+    });
+
+    sendSuccess(res, counts, 'Semester reset completed');
+  } finally {
+    // C-04: Always release lock
+    await redis.del(lockKey).catch(() => null);
+  }
 });

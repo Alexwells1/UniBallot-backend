@@ -4,11 +4,17 @@ import { EmailLog } from "../../models/Emaillog";
 import { SuppressedAddress } from "../../models/Suppressedaddress";
 import { EmailJobData, emailRetryQueue } from "./Emailqueue.service";
 import { sendViaResend } from "./Resend.provider";
-import { sendViaSES } from "./Sesprovider";
-import type { ProviderSendOptions } from "./Sesprovider";
 import { sendViaBrevo } from "./Brevoprovider";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
+
+
+
+export interface ProviderSendOptions {
+  to:      string;
+  subject: string;
+  html:    string;
+}
 
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAYS = [60_000, 180_000, 300_000];
@@ -27,9 +33,8 @@ interface Provider {
 }
 
 const providers: Provider[] = [
-  { name: "brevo", fn: sendViaBrevo },
-  { name: "ses", fn: sendViaSES },
   { name: "resend", fn: sendViaResend },
+  { name: "brevo", fn: sendViaBrevo },
 ];
 
 // ─── Core send logic ──────────────────────────────────────────────────────────

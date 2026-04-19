@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import rateLimit from 'express-rate-limit';
 import { authenticate } from '../middleware/authenticate';
 import { authorize } from '../middleware/authorize';
 import { authorizeElection } from '../middleware/authorizeElection';
@@ -57,6 +58,17 @@ import {
 
 const router = Router();
 
+// C-06: Status transition rate limiter — 5 per minute per user per election
+const statusTransitionLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 5,
+  keyGenerator: (req) => `${req.user?._id ?? req.ip}:${req.params.id}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many status transitions, please try again later' },
+  statusCode: 429,
+});
+
 // Public — rate-limited to prevent election code brute-forcing (F-11)
 router.get('/code/:code',         codeLookupLimiter, getElectionByCode);
 router.get('/code/:code/results', authenticate, authorize('super_admin', 'student'), getResultsByCode);
@@ -76,7 +88,8 @@ router.patch('/:id',  authenticate, authorize('super_admin'), updateElection);
 router.delete('/:id', authenticate, authorize('super_admin'),
   validate(z.object({ force: z.boolean().optional() })), deleteElection);
 
-router.patch('/:id/status',  authenticate, authorizeElection,
+// C-06: Apply status transition rate limiter
+router.patch('/:id/status',  authenticate, authorizeElection, statusTransitionLimiter,
   validate(z.object({ status: z.string().min(1) })), transitionStatus);
 router.post('/:id/lockdown', authenticate, authorize('super_admin'),
   validate(z.object({ active: z.boolean() })), toggleLockdown);

@@ -77,4 +77,8 @@ const electionSchema = new Schema<IElection>(
   { timestamps: true }
 );
 
+// H-01: Add performance indexes
+electionSchema.index({ status: 1 });
+electionSchema.index({ status: 1, createdAt: -1 });
+
 export default mongoose.model<IElection>('Election', electionSchema);

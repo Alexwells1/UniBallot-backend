@@ -13,4 +13,5 @@ const associationMemberSchema = new Schema<IAssociationMember>({
 
 associationMemberSchema.index({ electionId: 1, matricNumber: 1 }, { unique: true });
 
+
 export default mongoose.model<IAssociationMember>('AssociationMember', associationMemberSchema);

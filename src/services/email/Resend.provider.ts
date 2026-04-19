@@ -1,6 +1,10 @@
 import { Resend } from 'resend';
 import { env } from '../../config/env';
-import type { ProviderSendOptions } from './Sesprovider';
+export interface ProviderSendOptions {
+  to:      string;
+  subject: string;
+  html:    string;
+}
 
 const resend = new Resend(env.EMAIL_API_KEY);
 

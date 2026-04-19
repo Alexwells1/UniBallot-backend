@@ -15,6 +15,7 @@ const registeredVoterSchema = new Schema<IRegisteredVoter>({
   userId:      { type: Schema.Types.ObjectId, ref: 'User',     required: true },
   hasVoted:    { type: Boolean, default: false },
   ballotToken: { type: String },
+  // H-04: Use crypto.randomBytes for receipt code generation (done in voting service)
   receiptCode: { type: String },
   votedAt:     { type: Date },
 });
@@ -22,7 +23,7 @@ const registeredVoterSchema = new Schema<IRegisteredVoter>({
 // Primary double-vote guard — must be unique
 registeredVoterSchema.index({ electionId: 1, userId: 1 }, { unique: true });
 
-// Added: receipt lookup index for verifyReceipt — was doing a collection scan
-registeredVoterSchema.index({ electionId: 1, receiptCode: 1 });
+// H-04: Add unique index for receipt code per election
+registeredVoterSchema.index({ electionId: 1, receiptCode: 1 }, { unique: true });
 
 export default mongoose.model<IRegisteredVoter>('RegisteredVoter', registeredVoterSchema);

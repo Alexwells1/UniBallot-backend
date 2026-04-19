@@ -54,23 +54,28 @@ export async function getBallot(electionId: string, userId: string) {
     candidatesByOffice.get(key)!.push(c);
   }
 
-  return offices.map((office) => {
-    const candidates = candidatesByOffice.get(office._id.toString()) ?? [];
-    const voteType   = candidates.length === 1 ? 'confirmation' : 'competitive';
-    return {
-      officeId:          office._id,
-      officeTitle:       office.title,
-      officeDescription: office.description,
-      voteType,
-      candidates: candidates.map((c) => ({
-        candidateId: c._id,
-        fullName:    c.fullName,
-        bio:         c.bio,
-        photoUrl:    c.photoUrl,
-      })),
-      options: voteType === 'confirmation' ? ['approve', 'reject'] : undefined,
-    };
-  });
+  // H-10: Add isLocked and lockdownMessage fields to ballot response
+  return {
+    isLocked:        election.isLocked,
+    lockdownMessage: election.isLocked ? 'Election in emergency lockdown' : undefined,
+    offices: offices.map((office) => {
+      const candidates = candidatesByOffice.get(office._id.toString()) ?? [];
+      const voteType   = candidates.length === 1 ? 'confirmation' : 'competitive';
+      return {
+        officeId:          office._id,
+        officeTitle:       office.title,
+        officeDescription: office.description,
+        voteType,
+        candidates: candidates.map((c) => ({
+          candidateId: c._id,
+          fullName:    c.fullName,
+          bio:         c.bio,
+          photoUrl:    c.photoUrl,
+        })),
+        options: voteType === 'confirmation' ? ['approve', 'reject'] : undefined,
+      };
+    }),
+  };
 }
 
 // ── Submit Ballot ─────────────────────────────────────────────────────────────
@@ -138,8 +143,22 @@ export async function submitBallot(
     }
   }
 
-  // ── Step 4: Build vote documents ─────────────────────────────────────────
-  const ballotToken = crypto.randomUUID();
+  // ── Step 4: Build vote documents with UUID collision retry ────────────────
+  // C-08: Add retry logic for UUID collision — max 3 retries
+  let ballotToken: string | null = null;
+  const MAX_UUID_RETRIES = 3;
+  for (let attempt = 0; attempt < MAX_UUID_RETRIES; attempt++) {
+    const candidate = crypto.randomUUID();
+    const exists = await Vote.findOne({ ballotToken: candidate }).lean();
+    if (!exists) {
+      ballotToken = candidate;
+      break;
+    }
+  }
+  if (!ballotToken) {
+    throw new AppError(500, 'Failed to generate a unique ballot token after maximum retries');
+  }
+
   const submittedAt = new Date();
   const receiptCode = crypto.randomBytes(4).toString('hex').toUpperCase();
   const electionOid = new mongoose.Types.ObjectId(electionId);
@@ -158,16 +177,6 @@ export async function submitBallot(
   });
 
   // ── Step 5: Transaction — atomic double-vote guard + vote insert ──────────
-  //
-  // All three writes are wrapped in a single MongoDB session/transaction:
-  //   1. FindOneAndUpdate on RegisteredVoter with hasVoted:false condition
-  //      (atomic — only one concurrent request will succeed)
-  //   2. Vote.insertMany
-  //   3. RegisteredVoter update with token + receipt
-  //
-  // If anything fails after the flag is set, the transaction is aborted and
-  // the flag reverts automatically — no manual rollback needed.
-
   const session = await mongoose.startSession();
   try {
     session.startTransaction({

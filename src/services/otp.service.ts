@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { redis } from '../config/redis';
+import OtpVerification from '../models/OtpVerification';
 import {
   OTP_EXPIRY_MINUTES,
   OTP_MAX_ATTEMPTS,
@@ -25,18 +26,63 @@ function sessionKey(email: string): string {
   return `otp:${email}`;
 }
 
+// H-07: Try Redis first, fallback to MongoDB
 async function readSession(email: string): Promise<OtpSession | null> {
+  // Try Redis first
   const raw = await redis.get(sessionKey(email)).catch(() => null);
-  if (!raw) return null;
-  return JSON.parse(raw) as OtpSession;
+  if (raw) return JSON.parse(raw) as OtpSession;
+
+  // Fallback to MongoDB
+  const record = await OtpVerification.findOne({ email: email.toLowerCase() }).catch(() => null);
+  if (!record) return null;
+
+  const now = Date.now();
+  if (record.expiresAt.getTime() < now) return null;
+
+  const session: OtpSession = {
+    otpHash:        record.otpHash,
+    passwordHash:   record.passwordHash ?? '',
+    attempts:       record.attempts,
+    resendAttempts: record.resendAttempts,
+    locked:         record.locked,
+    expiresAt:      record.expiresAt.getTime(),
+    updatedAt:      record.updatedAt.getTime(),
+  };
+
+  // H-07: Repopulate Redis if retrieved from MongoDB
+  const ttlSeconds = Math.ceil((session.expiresAt - now) / 1_000);
+  if (ttlSeconds > 0) {
+    await redis.setEx(sessionKey(email), ttlSeconds, JSON.stringify(session)).catch(() => null);
+  }
+
+  return session;
 }
 
 async function writeSession(email: string, session: OtpSession, ttlSeconds: number): Promise<void> {
+  // H-07: Store OTP in BOTH Redis AND MongoDB
   await redis.setEx(sessionKey(email), ttlSeconds, JSON.stringify(session));
+
+  const expiresAt = new Date(session.expiresAt);
+  await OtpVerification.findOneAndUpdate(
+    { email: email.toLowerCase() },
+    {
+      $set: {
+        otpHash:        session.otpHash,
+        passwordHash:   session.passwordHash,
+        attempts:       session.attempts,
+        resendAttempts: session.resendAttempts,
+        locked:         session.locked,
+        expiresAt,
+        updatedAt:      new Date(session.updatedAt),
+      },
+    },
+    { upsert: true, new: true }
+  ).catch(() => null);
 }
 
 async function deleteSession(email: string): Promise<void> {
   await redis.del(sessionKey(email)).catch(() => null);
+  await OtpVerification.deleteOne({ email: email.toLowerCase() }).catch(() => null);
 }
 
 export function generateOtp(): string {

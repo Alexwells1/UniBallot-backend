@@ -12,8 +12,10 @@ const envSchema = z.object({
   JWT_REFRESH_SECRET:    z.string().min(32, 'JWT_REFRESH_SECRET must be at least 32 chars'),
   JWT_REFRESH_EXPIRY:    z.string().default('7d'),
   VOTE_HASH_SECRET:      z.string().min(32, 'VOTE_HASH_SECRET must be at least 32 chars'),
-  EMAIL_API_KEY:         z.string().min(1, 'EMAIL_API_KEY is required'),
-  EMAIL_FROM_ADDRESS:    z.string().email('EMAIL_FROM_ADDRESS must be a valid email'),
+  EMAIL_API_KEY:         z.string().min(1, 'EMAIL_API_KEY is required'),EMAIL_FROM_ADDRESS: z.string().regex(
+  /^(.+\s)?<[^<>@\s]+@[^<>@\s]+\.[^<>@\s]+>$|^[^@\s]+@[^@\s]+\.[^@\s]+$/,
+  'EMAIL_FROM_ADDRESS must be a valid email or "Name <email>" format'
+),
   FRONTEND_ORIGIN:       z.string().min(1, 'FRONTEND_ORIGIN is required'),
   SUPER_ADMIN_EMAIL:     z.string().email('SUPER_ADMIN_EMAIL must be a valid email'),
   SUPER_ADMIN_PASSWORD:  z.string().min(8, 'SUPER_ADMIN_PASSWORD must be at least 8 chars'),

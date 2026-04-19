@@ -2,6 +2,11 @@ import { parse } from 'csv-parse';
 import type { Types } from 'mongoose';
 import AssociationMember from '../models/AssociationMember';
 import { MATRIC_NUMBER_REGEX } from '../config/constants';
+import { AppError } from '../utils/AppError';
+
+// C-05: Size and row limits
+const MAX_CSV_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+const MAX_CSV_ROWS = 50000;
 
 interface CsvRow {
   matric_number: string;
@@ -26,7 +31,17 @@ export async function processMembersCsv(
   buffer:     Buffer,
   electionId: string | Types.ObjectId
 ): Promise<CsvUploadReport> {
+  // C-05: Validate buffer size before processing
+  if (buffer.length > MAX_CSV_SIZE_BYTES) {
+    throw new AppError(400, `CSV file exceeds maximum allowed size of ${MAX_CSV_SIZE_BYTES / (1024 * 1024)}MB`);
+  }
+
   const rows = await parseCsv(buffer);
+
+  // C-05: Validate row count before processing
+  if (rows.length > MAX_CSV_ROWS) {
+    throw new AppError(400, `CSV file exceeds maximum allowed rows of ${MAX_CSV_ROWS}`);
+  }
 
   const report: CsvUploadReport = {
     processed:        rows.length,

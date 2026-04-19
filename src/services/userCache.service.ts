@@ -8,7 +8,8 @@ import { sanitizeUser } from '../utils/sanitize';
  */
 export type CachedUser = Omit<IUser, 'passwordHash'>;
 
-const TTL_SECONDS = 300;
+// H-12: Use 1 hour TTL for user cache
+const TTL_SECONDS = 3600;
 const prefix      = (id: string) => `user:${id}`;
 
 export async function getCachedUser(userId: string): Promise<CachedUser | null> {
@@ -28,6 +29,7 @@ export async function getCachedUser(userId: string): Promise<CachedUser | null> 
 export async function setCachedUser(user: IUser): Promise<void> {
   try {
     const safe = sanitizeUser(user);
+    // H-12: setEx with 1 hour TTL (3600 seconds)
     await redis.setEx(prefix(user._id.toString()), TTL_SECONDS, JSON.stringify(safe));
   } catch {
     // Non-fatal — DB will serve the next request

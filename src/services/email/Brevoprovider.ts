@@ -1,8 +1,14 @@
 import { env } from '../../config/env';
-import type { ProviderSendOptions } from './Sesprovider';
+
+
+export interface ProviderSendOptions {
+  to:      string;
+  subject: string;
+  html:    string;
+}
 
 const BREVO_API_URL      = 'https://api.brevo.com/v3/smtp/email';
-const REQUEST_TIMEOUT_MS = 10_000; // 10 seconds
+const REQUEST_TIMEOUT_MS = 10_000; 
 
 console.log('[brevo] Brevo client initialized');
 

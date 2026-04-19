@@ -1,7 +1,9 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
+import mongoose from 'mongoose';
 import Election from '../models/Election';
 import AssociationMember from '../models/AssociationMember';
+import RegisteredVoter from '../models/RegisteredVoter';
 import { AppError } from '../utils/AppError';
 import { asyncHandler } from '../utils/asyncHandler';
 import { sendSuccess, sendPaginated } from '../utils/apiResponse';
@@ -36,25 +38,30 @@ export const uploadMembers = asyncHandler(async (req: Request, res: Response) =>
 // ─── List ──────────────────────────────────────────────────────────────────────
 
 export const listMembers = asyncHandler(async (req: Request, res: Response) => {
-  const pageNum  = Math.max(1, parseInt(req.query.page  as string || '1',  10));
+  // H-05: Implement cursor-based pagination
   const limitNum = Math.min(200, Math.max(1, parseInt(req.query.limit as string || '50', 10)));
-  const skip     = (pageNum - 1) * limitNum;
+  const cursor   = req.query.cursor as string | undefined;
 
   const search = (req.query.search as string || '').trim();
   const filter: Record<string, unknown> = { electionId: req.params.id };
 
-  if (search) {
-    // Escape metacharacters to prevent ReDoS via crafted search strings
-    const escaped = search.slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    filter.matricNumber = { $regex: escaped, $options: 'i' };
+  if (cursor && mongoose.Types.ObjectId.isValid(cursor)) {
+    filter._id = { $gt: new mongoose.Types.ObjectId(cursor) };
   }
 
-  const [members, total] = await Promise.all([
-    AssociationMember.find(filter).skip(skip).limit(limitNum),
-    AssociationMember.countDocuments(filter),
-  ]);
+  if (search) {
+    // H-11: Anchored regex for search filtering
+    const escaped = search.slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    filter.matricNumber = { $regex: '^' + escaped, $options: 'i' };
+  }
 
-  sendPaginated(res, members, total, pageNum, limitNum);
+  const members = await AssociationMember.find(filter).limit(limitNum + 1).sort({ _id: 1 });
+
+  const hasMore    = members.length > limitNum;
+  const data       = hasMore ? members.slice(0, limitNum) : members;
+  const nextCursor = hasMore ? data[data.length - 1]._id.toString() : null;
+
+  sendSuccess(res, { data, nextCursor, hasMore });
 });
 
 // ─── Get single ────────────────────────────────────────────────────────────────
@@ -150,6 +157,12 @@ export const clearMembers = asyncHandler(async (req: Request, res: Response) => 
   if (election.status !== 'setup')
     throw new AppError(400, 'Members can only be cleared in setup status');
   if (election.membersLocked) throw new AppError(409, 'Member list is locked');
+
+  // H-06: Before clearing members, check for registered voters
+  const registeredVoterCount = await RegisteredVoter.countDocuments({ electionId: election._id });
+  if (registeredVoterCount > 0) {
+    throw new AppError(409, `Cannot clear members: ${registeredVoterCount} voter(s) are already registered for this election`);
+  }
 
   await AssociationMember.deleteMany({ electionId: election._id });
 
