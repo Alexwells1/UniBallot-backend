@@ -42,7 +42,6 @@ export async function getBallot(electionId: string, userId: string) {
 
   const offices = await Office.find({ electionId }).sort({ createdAt: 1 });
 
-  // Batch all candidate queries in one round-trip (was N+1 per office)
   const allCandidates = await Candidate.find({
     officeId: { $in: offices.map((o) => o._id) },
   });
@@ -54,7 +53,6 @@ export async function getBallot(electionId: string, userId: string) {
     candidatesByOffice.get(key)!.push(c);
   }
 
-  // H-10: Add isLocked and lockdownMessage fields to ballot response
   return {
     isLocked:        election.isLocked,
     lockdownMessage: election.isLocked ? 'Election in emergency lockdown' : undefined,
@@ -92,8 +90,6 @@ export async function submitBallot(
   if (election.status !== 'voting_open') throw new AppError(400, 'Voting is not open');
   if (election.isLocked) throw new AppError(423, 'Election is in lockdown');
 
-  // Batch-load offices + candidates before opening the transaction to
-  // minimise time holding the session open.
   const offices = await Office.find({ electionId });
   const allCandidates = await Candidate.find({
     officeId: { $in: offices.map((o) => o._id) },
@@ -143,21 +139,11 @@ export async function submitBallot(
     }
   }
 
-  // ── Step 4: Build vote documents with UUID collision retry ────────────────
-  // C-08: Add retry logic for UUID collision — max 3 retries
-  let ballotToken: string | null = null;
-  const MAX_UUID_RETRIES = 3;
-  for (let attempt = 0; attempt < MAX_UUID_RETRIES; attempt++) {
-    const candidate = crypto.randomUUID();
-    const exists = await Vote.findOne({ ballotToken: candidate }).lean();
-    if (!exists) {
-      ballotToken = candidate;
-      break;
-    }
-  }
-  if (!ballotToken) {
-    throw new AppError(500, 'Failed to generate a unique ballot token after maximum retries');
-  }
+  // ── Step 4: Build vote documents ─────────────────────────────────────────
+  // FIX 1: Removed UUID collision retry loop — crypto.randomUUID() collision
+  // probability is ~1 in 2^122. The unique index on Vote will catch the
+  // astronomically rare duplicate, and isDupKey() below surfaces it as 409.
+  const ballotToken = crypto.randomUUID();
 
   const submittedAt = new Date();
   const receiptCode = crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -180,15 +166,17 @@ export async function submitBallot(
   const session = await mongoose.startSession();
   try {
     session.startTransaction({
-      readConcern:    { level: 'snapshot' },
-      writeConcern:   { w: 'majority' },
+      readConcern:     { level: 'snapshot' },
+      writeConcern:    { w: 'majority' },
       maxCommitTimeMS: 10_000,
     });
 
-    // Atomic double-vote guard inside the transaction
+    // FIX 2: Merged two RegisteredVoter updates into one round-trip.
+    // Previously: findOneAndUpdate (flip hasVoted) + findOneAndUpdate (stamp receipt).
+    // Now: single atomic update that does both in the same write.
     const voter = await RegisteredVoter.findOneAndUpdate(
       { electionId, userId, hasVoted: false },
-      { $set: { hasVoted: true } },
+      { $set: { hasVoted: true, ballotToken, receiptCode, votedAt: submittedAt } },
       { new: false, session }
     );
 
@@ -200,22 +188,12 @@ export async function submitBallot(
       throw new AppError(409, 'You have already voted');
     }
 
-    // Insert all vote documents atomically
     await Vote.insertMany(voteDocs, { session });
-
-    // Stamp receipt + token on the voter record
-    await RegisteredVoter.findOneAndUpdate(
-      { electionId, userId },
-      { $set: { ballotToken, receiptCode, votedAt: submittedAt } },
-      { session }
-    );
 
     await session.commitTransaction();
   } catch (err) {
-    // abortTransaction is idempotent — safe to call even if already aborted above
     await session.abortTransaction().catch(() => null);
 
-    // Duplicate key on the Vote unique index = concurrent request already committed
     const isDupKey = (e: unknown) => {
       if (typeof e !== 'object' || e === null) return false;
       const code        = (e as { code?: number }).code;
@@ -233,8 +211,11 @@ export async function submitBallot(
     session.endSession();
   }
 
-  // ── Step 6: Audit log (outside transaction — non-critical) ────────────────
-  await logAction({
+  // ── Step 6: Audit log (fire-and-forget — non-critical) ───────────────────
+  // FIX 3: Removed await — the response is already committed and ready to
+  // return. Holding the HTTP response open for an audit write serves no
+  // purpose and adds ~50-200ms of unnecessary latency under load.
+  logAction({
     action:      AUDIT_ACTIONS.VOTE_SUBMITTED,
     performedBy: userId,
     targetId:    electionOid,
