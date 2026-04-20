@@ -9,11 +9,15 @@ import fetch from 'node-fetch';
 import { initRedisLimiters } from './middleware/rateLimiter';
 
 const PORT = parseInt(env.PORT, 10);
+const RENDER_URL = 'https://uniballot-backend-2rtr.onrender.com';
 
 let integrityWorker: Worker | null = null;
 
+const pingIntervals: ReturnType<typeof setInterval>[] = [];
+
 async function gracefulShutdown(signal: string): Promise<void> {
   console.log(`[server] ${signal} received — shutting down gracefully`);
+  for (const interval of pingIntervals) clearInterval(interval);
   try {
     await stopEmailWorkers();
     if (integrityWorker) await integrityWorker.close();
@@ -30,6 +34,31 @@ process.on('unhandledRejection', (reason) => {
   console.error('Unhandled Promise Rejection:', reason);
   process.exit(1);
 });
+
+async function ping(url: string): Promise<void> {
+  console.log(`[${new Date().toISOString()}] self-ping attempting → ${url}`);
+  try {
+    const res = await fetch(url);
+    console.log(`[${new Date().toISOString()}] self-ping OK (${url}) ${res.status}`);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] self-ping FAILED (${url}):`, err);
+  }
+}
+
+function startSelfPing(): void {
+  const INTERNAL_URL = `http://127.0.0.1:${PORT}/health`;
+  const EXTERNAL_URL = ((env as Record<string, string>)['SELF_PING_URL'] ?? RENDER_URL) + '/health';
+
+  // Fire immediately on startup
+  ping(INTERNAL_URL);
+  ping(EXTERNAL_URL);
+
+  // Both ping every 4 minutes
+  pingIntervals.push(setInterval(() => ping(INTERNAL_URL), 4 * 60_000));
+  pingIntervals.push(setInterval(() => ping(EXTERNAL_URL), 4 * 60_000));
+
+  console.log(`[server] ✅ Self-ping started → internal: ${INTERNAL_URL} | external: ${EXTERNAL_URL}`);
+}
 
 async function bootstrap(): Promise<void> {
   try {
@@ -53,45 +82,6 @@ async function bootstrap(): Promise<void> {
     console.error('❌ Failed to start server:', error);
     process.exit(1);
   }
-}
-
-/**
- * Self-ping to prevent Render.com free-tier spin-down.
- * Only active in production and only when SELF_PING_URL is configured.
- * The external ping URL is read from the environment to avoid hardcoding
- * any deployment-specific hostname in source code.
- */
-function startSelfPing(): void {
-  if (env.NODE_ENV !== 'production') return;
-
-  const INTERNAL_URL = `http://127.0.0.1:${PORT}/health`;
-  const EXTERNAL_URL = (env as Record<string, string>)['SELF_PING_URL'];
-
-  async function ping(url: string): Promise<void> {
-    try {
-      const res = await fetch(url);
-      console.log(`[${new Date().toISOString()}] self-ping (${url}) ${res.status}`);
-    } catch (err) {
-      console.error(`[${new Date().toISOString()}] self-ping (${url}) failed:`, err);
-    }
-  }
-
-  ping(INTERNAL_URL);
-  const internalInterval = setInterval(() => ping(INTERNAL_URL), 180_000);
-
-  let externalInterval: ReturnType<typeof setInterval> | undefined;
-  if (EXTERNAL_URL) {
-    externalInterval = setInterval(() => ping(EXTERNAL_URL), 900_000);
-  }
-
-  process.once('SIGTERM', () => {
-    clearInterval(internalInterval);
-    if (externalInterval) clearInterval(externalInterval);
-  });
-  process.once('SIGINT', () => {
-    clearInterval(internalInterval);
-    if (externalInterval) clearInterval(externalInterval);
-  });
 }
 
 bootstrap();
