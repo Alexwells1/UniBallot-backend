@@ -55,6 +55,7 @@ import {
   getIntegrityResult,
   voteSubmissionSchema,
 } from '../controllers/voting.controller';
+import { concurrencyLimit } from '../middleware/concurrencyLimit';
 
 const router = Router();
 
@@ -107,7 +108,7 @@ router.patch('/:id/offices/:officeId',   authenticate, authorizeElection, update
 router.delete('/:id/offices/:officeId',  authenticate, authorizeElection, deleteOffice);
 
 router.get('/:id/ballot', authenticate, authorize('student'), getBallotHandler);
-router.post('/:id/vote',  authenticate, authorize('student'), votingLimiter,
+router.post('/:id/vote',  authenticate, concurrencyLimit, authorize('student'), votingLimiter,
   validate(voteSubmissionSchema), submitBallotHandler);
 
 router.get('/:id/results/preview', authenticate, authorizeElection, previewResults);

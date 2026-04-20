@@ -9,6 +9,7 @@ import RegisteredVoter from '../models/RegisteredVoter';
 import Vote from '../models/Vote';
 import { logAction } from './audit.service';
 import { AUDIT_ACTIONS } from '../config/constants';
+import { voteLimit } from '../server';
 
 export interface VoteSubmission {
   officeId:            string;
@@ -76,9 +77,23 @@ export async function getBallot(electionId: string, userId: string) {
   };
 }
 
-// ── Submit Ballot ─────────────────────────────────────────────────────────────
+// ── Submit Ballot (public wrapper — enforces concurrency cap) ─────────────────
 
-export async function submitBallot(
+export function submitBallot(
+  electionId: string,
+  userId:     string,
+  votes:      VoteSubmission[]
+): Promise<{ receiptCode: string }> {
+  // voteLimit queues calls beyond 40 concurrent instead of hammering MongoDB.
+  // p-limit rejects nothing — it queues — so callers still get a result,
+  // just slightly delayed. The concurrencyLimit middleware in front of the
+  // route handler is the hard shed layer; this is the soft DB protection layer.
+  return voteLimit(() => _submitBallot(electionId, userId, votes));
+}
+
+// ── Submit Ballot (internal implementation) ───────────────────────────────────
+
+async function _submitBallot(
   electionId: string,
   userId:     string,
   votes:      VoteSubmission[]
@@ -139,12 +154,8 @@ export async function submitBallot(
     }
   }
 
-  // ── Step 4: Build vote documents ─────────────────────────────────────────
-  // FIX 1: Removed UUID collision retry loop — crypto.randomUUID() collision
-  // probability is ~1 in 2^122. The unique index on Vote will catch the
-  // astronomically rare duplicate, and isDupKey() below surfaces it as 409.
+  // ── Step 4: Build vote documents ──────────────────────────────────────────
   const ballotToken = crypto.randomUUID();
-
   const submittedAt = new Date();
   const receiptCode = crypto.randomBytes(4).toString('hex').toUpperCase();
   const electionOid = new mongoose.Types.ObjectId(electionId);
@@ -171,9 +182,6 @@ export async function submitBallot(
       maxCommitTimeMS: 10_000,
     });
 
-    // FIX 2: Merged two RegisteredVoter updates into one round-trip.
-    // Previously: findOneAndUpdate (flip hasVoted) + findOneAndUpdate (stamp receipt).
-    // Now: single atomic update that does both in the same write.
     const voter = await RegisteredVoter.findOneAndUpdate(
       { electionId, userId, hasVoted: false },
       { $set: { hasVoted: true, ballotToken, receiptCode, votedAt: submittedAt } },
@@ -181,7 +189,6 @@ export async function submitBallot(
     );
 
     if (!voter) {
-      // Distinguish "not registered" from "already voted"
       const existing = await RegisteredVoter.findOne({ electionId, userId }).session(session);
       await session.abortTransaction();
       if (!existing) throw new AppError(403, 'You are not registered for this election');
@@ -212,9 +219,6 @@ export async function submitBallot(
   }
 
   // ── Step 6: Audit log (fire-and-forget — non-critical) ───────────────────
-  // FIX 3: Removed await — the response is already committed and ready to
-  // return. Holding the HTTP response open for an audit write serves no
-  // purpose and adds ~50-200ms of unnecessary latency under load.
   logAction({
     action:      AUDIT_ACTIONS.VOTE_SUBMITTED,
     performedBy: userId,
