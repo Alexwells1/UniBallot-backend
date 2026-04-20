@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from 'express'; // fix: import types explicitly
 
 let activeRequests = 0;
-const MAX_CONCURRENT = 80;
+const MAX_CONCURRENT = 150;
 
 // Track whether we've already decremented for this request.
 // Without this guard, both 'finish' and 'close' firing on the same

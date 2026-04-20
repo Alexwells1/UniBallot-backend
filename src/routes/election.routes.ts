@@ -1,12 +1,16 @@
-import { Router } from 'express';
-import { z } from 'zod';
-import rateLimit from 'express-rate-limit';
-import { authenticate } from '../middleware/authenticate';
-import { authorize } from '../middleware/authorize';
-import { authorizeElection } from '../middleware/authorizeElection';
-import { validate } from '../middleware/validate';
-import { uploadCsv } from '../middleware/upload';
-import { votingLimiter, receiptLimiter, codeLookupLimiter } from '../middleware/rateLimiter';
+import { Router } from "express";
+import { z } from "zod";
+import rateLimit from "express-rate-limit";
+import { authenticate } from "../middleware/authenticate";
+import { authorize } from "../middleware/authorize";
+import { authorizeElection } from "../middleware/authorizeElection";
+import { validate } from "../middleware/validate";
+import { uploadCsv } from "../middleware/upload";
+import {
+  votingLimiter,
+  receiptLimiter,
+  codeLookupLimiter,
+} from "../middleware/rateLimiter";
 
 import {
   createElection,
@@ -28,7 +32,7 @@ import {
   getOpenElections,
   exportResultsCsv,
   exportResultsPdf,
-} from '../controllers/election.controller';
+} from "../controllers/election.controller";
 
 import {
   uploadMembers,
@@ -37,7 +41,7 @@ import {
   getMember,
   updateMember,
   deleteMember,
-} from '../controllers/member.controller';
+} from "../controllers/member.controller";
 
 import {
   createOffice,
@@ -45,7 +49,7 @@ import {
   listOffices,
   updateOffice,
   deleteOffice,
-} from '../controllers/office.controller';
+} from "../controllers/office.controller";
 
 import {
   getBallotHandler,
@@ -54,8 +58,8 @@ import {
   integrityCheck,
   getIntegrityResult,
   voteSubmissionSchema,
-} from '../controllers/voting.controller';
-import { concurrencyLimit } from '../middleware/concurrencyLimit';
+} from "../controllers/voting.controller";
+import { concurrencyLimit } from "../middleware/concurrencyLimit";
 
 const router = Router();
 
@@ -66,60 +70,185 @@ const statusTransitionLimiter = rateLimit({
   keyGenerator: (req) => `${req.user?._id ?? req.ip}:${req.params.id}`,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { success: false, message: 'Too many status transitions, please try again later' },
+  message: {
+    success: false,
+    message: "Too many status transitions, please try again later",
+  },
   statusCode: 429,
 });
 
 // Public — rate-limited to prevent election code brute-forcing (F-11)
-router.get('/code/:code',         codeLookupLimiter, getElectionByCode);
-router.get('/code/:code/results', authenticate, authorize('super_admin', 'student'), getResultsByCode);
+router.get("/code/:code", codeLookupLimiter, getElectionByCode);
+router.get(
+  "/code/:code/results",
+  authenticate,
+  authorize("super_admin", "student"),
+  getResultsByCode,
+);
 
-router.post('/register', authenticate, authorize('student'),
-  validate(z.object({ electionCode: z.string().min(1) })), registerForElection);
+router.post(
+  "/register",
+  authenticate,
+  authorize("student"),
+  validate(z.object({ electionCode: z.string().min(1) })),
+  registerForElection,
+);
 
-router.post('/', authenticate, authorize('super_admin'), validate(createElectionSchema), createElection);
-router.get('/',  authenticate, authorize('super_admin', 'officer'), listElections);
-router.get('/open', getOpenElections);
-router.get('/my',   authenticate, authorize('student'), listMyElections);
+router.post(
+  "/",
+  authenticate,
+  authorize("super_admin"),
+  validate(createElectionSchema),
+  createElection,
+);
+router.get(
+  "/",
+  authenticate,
+  authorize("super_admin", "officer"),
+  listElections,
+);
+router.get("/open", getOpenElections);
+router.get("/my", authenticate, authorize("student"), listMyElections);
 
-router.get('/:id/receipt/:code', receiptLimiter, verifyReceipt);
+router.get("/:id/receipt/:code", receiptLimiter, verifyReceipt);
 
-router.get('/:id',    authenticate, authorizeElection, getElection);
-router.patch('/:id',  authenticate, authorize('super_admin'), updateElection);
-router.delete('/:id', authenticate, authorize('super_admin'),
-  validate(z.object({ force: z.boolean().optional() })), deleteElection);
+router.get("/:id", authenticate, authorizeElection, getElection);
+router.patch("/:id", authenticate, authorize("super_admin"), updateElection);
+router.delete(
+  "/:id",
+  authenticate,
+  authorize("super_admin"),
+  validate(z.object({ force: z.boolean().optional() })),
+  deleteElection,
+);
 
 // C-06: Apply status transition rate limiter
-router.patch('/:id/status',  authenticate, authorizeElection, statusTransitionLimiter,
-  validate(z.object({ status: z.string().min(1) })), transitionStatus);
-router.post('/:id/lockdown', authenticate, authorize('super_admin'),
-  validate(z.object({ active: z.boolean() })), toggleLockdown);
+router.patch(
+  "/:id/status",
+  authenticate,
+  authorizeElection,
+  statusTransitionLimiter,
+  validate(z.object({ status: z.string().min(1) })),
+  transitionStatus,
+);
+router.post(
+  "/:id/lockdown",
+  authenticate,
+  authorize("super_admin"),
+  validate(z.object({ active: z.boolean() })),
+  toggleLockdown,
+);
 
-router.post('/:id/members',              authenticate, authorizeElection, uploadCsv, uploadMembers);
-router.get('/:id/members',               authenticate, authorizeElection, listMembers);
-router.delete('/:id/members',            authenticate, authorize('super_admin'), clearMembers);
-router.get('/:id/members/:memberId',     authenticate, authorizeElection, getMember);
-router.patch('/:id/members/:memberId',   authenticate, authorizeElection, updateMember);
-router.delete('/:id/members/:memberId',  authenticate, authorizeElection, deleteMember);
+router.post(
+  "/:id/members",
+  authenticate,
+  authorizeElection,
+  uploadCsv,
+  uploadMembers,
+);
+router.get("/:id/members", authenticate, authorizeElection, listMembers);
+router.delete(
+  "/:id/members",
+  authenticate,
+  authorize("super_admin"),
+  clearMembers,
+);
+router.get(
+  "/:id/members/:memberId",
+  authenticate,
+  authorizeElection,
+  getMember,
+);
+router.patch(
+  "/:id/members/:memberId",
+  authenticate,
+  authorizeElection,
+  updateMember,
+);
+router.delete(
+  "/:id/members/:memberId",
+  authenticate,
+  authorizeElection,
+  deleteMember,
+);
 
-router.post('/:id/offices',              authenticate, authorizeElection, validate(officeSchema), createOffice);
-router.get('/:id/offices',               authenticate, authorizeElection, listOffices);
-router.patch('/:id/offices/:officeId',   authenticate, authorizeElection, updateOffice);
-router.delete('/:id/offices/:officeId',  authenticate, authorizeElection, deleteOffice);
+router.post(
+  "/:id/offices",
+  authenticate,
+  authorizeElection,
+  validate(officeSchema),
+  createOffice,
+);
+router.get("/:id/offices", authenticate, authorizeElection, listOffices);
+router.patch(
+  "/:id/offices/:officeId",
+  authenticate,
+  authorizeElection,
+  updateOffice,
+);
+router.delete(
+  "/:id/offices/:officeId",
+  authenticate,
+  authorizeElection,
+  deleteOffice,
+);
 
-router.get('/:id/ballot', authenticate, authorize('student'), getBallotHandler);
-router.post('/:id/vote',  authenticate, concurrencyLimit, authorize('student'), votingLimiter,
-  validate(voteSubmissionSchema), submitBallotHandler);
+router.get("/:id/ballot", authenticate, authorize("student"), getBallotHandler);
+// In election.routes.ts — move concurrencyLimit FIRST
+router.post(
+  "/:id/vote",
+  concurrencyLimit, 
+  authenticate,
+  authorize("student"),
+  votingLimiter,
+  validate(voteSubmissionSchema),
+  submitBallotHandler,
+);
 
-router.get('/:id/results/preview', authenticate, authorizeElection, previewResults);
-router.get('/:id/results',         authenticate, authorize('super_admin', 'student'), getResults);
-router.post('/:id/publish-results', authenticate, authorizeElection, publishResults);
+router.get(
+  "/:id/results/preview",
+  authenticate,
+  authorizeElection,
+  previewResults,
+);
+router.get(
+  "/:id/results",
+  authenticate,
+  authorize("super_admin", "student"),
+  getResults,
+);
+router.post(
+  "/:id/publish-results",
+  authenticate,
+  authorizeElection,
+  publishResults,
+);
 
-router.get('/:id/analytics',               authenticate, authorizeElection, getAnalytics);
-router.get('/:id/integrity-check',         authenticate, authorize('super_admin'), integrityCheck);
-router.get('/:id/integrity-result/:jobId', authenticate, authorize('super_admin'), getIntegrityResult);
+router.get("/:id/analytics", authenticate, authorizeElection, getAnalytics);
+router.get(
+  "/:id/integrity-check",
+  authenticate,
+  authorize("super_admin"),
+  integrityCheck,
+);
+router.get(
+  "/:id/integrity-result/:jobId",
+  authenticate,
+  authorize("super_admin"),
+  getIntegrityResult,
+);
 
-router.get('/:id/export/csv', authenticate, authorize('super_admin', 'officer'), exportResultsCsv);
-router.get('/:id/export/pdf', authenticate, authorize('super_admin', 'officer'), exportResultsPdf);
+router.get(
+  "/:id/export/csv",
+  authenticate,
+  authorize("super_admin", "officer"),
+  exportResultsCsv,
+);
+router.get(
+  "/:id/export/pdf",
+  authenticate,
+  authorize("super_admin", "officer"),
+  exportResultsPdf,
+);
 
 export default router;
