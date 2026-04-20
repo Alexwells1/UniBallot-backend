@@ -17,7 +17,7 @@ const RENDER_URL = 'https://uniballot-backend-2rtr.onrender.com';
 // Caps simultaneous in-flight submitBallot calls at 40.
 // Requests beyond this cap queue inside p-limit rather than inside MongoDB,
 // which is cheaper and gives us back-pressure at the right layer.
-export const voteLimit = pLimit(40);
+export const voteLimit = pLimit(20);
 
 let integrityWorker: Worker | null = null;
 const pingIntervals: ReturnType<typeof setInterval>[] = [];
