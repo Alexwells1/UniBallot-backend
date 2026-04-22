@@ -558,26 +558,46 @@ export const deleteElection = asyncHandler(async (req: Request, res: Response) =
 });
 
 export const exportResultsCsv = asyncHandler(async (req: Request, res: Response) => {
-  const election = await Election.findById(req.params.id);
+  const election = await Election.findById(req.params.id)
+    .populate<{ associationId: { name: string } }>('associationId', 'name');
   if (!election) throw new AppError(404, 'Election not found');
-  if (election.status !== 'results_published') throw new AppError(400, 'Results must be published before exporting');
+  if (election.status !== 'results_published')
+    throw new AppError(400, 'Results must be published before exporting');
 
-  const tally    = await computeTally(election._id.toString());
-  const csv      = generateCsv(election, tally);
+  const [tally, registeredVoters] = await Promise.all([
+    computeTally(election._id.toString()),
+    RegisteredVoter.countDocuments({ electionId: election._id }),
+  ]);
+
+  const csv      = generateCsv(election as unknown as IElection, tally);
   const filename = `election-${election.electionCode}-results.csv`;
+
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.send(csv);
 });
 
 export const exportResultsPdf = asyncHandler(async (req: Request, res: Response) => {
-  const election = await Election.findById(req.params.id);
+  const election = await Election.findById(req.params.id)
+    .populate<{ associationId: { name: string } }>('associationId', 'name');
   if (!election) throw new AppError(404, 'Election not found');
-  if (election.status !== 'results_published') throw new AppError(400, 'Results must be published before exporting');
+  if (election.status !== 'results_published')
+    throw new AppError(400, 'Results must be published before exporting');
 
-  const tally    = await computeTally(election._id.toString());
+  const [tally, registeredVoters] = await Promise.all([
+    computeTally(election._id.toString()),
+    RegisteredVoter.countDocuments({ electionId: election._id }),
+  ]);
+
+  const associationName = election.associationId?.name ?? 'Students Union Government';
+
   const filename = `election-${election.electionCode}-results.pdf`;
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  await streamPdf(election, tally, res);
+
+  await streamPdf(election as unknown as IElection, tally, res, {
+    institutionName:  associationName,
+    subBodyName:      'Students Union Government',
+    registeredVoters,
+  });
 });

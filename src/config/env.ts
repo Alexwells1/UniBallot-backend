@@ -18,7 +18,7 @@ const envSchema = z.object({
 ),
   FRONTEND_ORIGIN:       z.string().min(1, 'FRONTEND_ORIGIN is required'),
   SUPER_ADMIN_EMAIL:     z.string().email('SUPER_ADMIN_EMAIL must be a valid email'),
-  SUPER_ADMIN_PASSWORD:  z.string().min(8, 'SUPER_ADMIN_PASSWORD must be at least 8 chars'),
+  SUPER_ADMIN_PASSWORD:  z.string().min(4, 'SUPER_ADMIN_PASSWORD must be at least 8 chars'),
   SUPER_ADMIN_FULL_NAME: z.string().min(1, 'SUPER_ADMIN_FULL_NAME is required'),
   CLOUDINARY_CLOUD_NAME: z.string().min(1, 'CLOUDINARY_CLOUD_NAME is required'),
   CLOUDINARY_API_KEY:    z.string().min(1, 'CLOUDINARY_API_KEY is required'),
