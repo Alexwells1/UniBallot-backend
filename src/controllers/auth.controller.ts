@@ -246,24 +246,23 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
   const { email, password } = req.body as z.infer<typeof loginSchema>;
   const normalised = email.toLowerCase();
 
+  // .lean() is intentional — faster read, no document methods needed here
   const user = await User.findOne({ email: normalised }).select('+passwordHash').lean();
   if (!user) {
-    // Constant-time dummy compare prevents email enumeration via timing
     await bcrypt.compare(password, '$2b$10$timingsafetyplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXX');
     throw new AppError(401, "Invalid email or password");
   }
-  if (!user.isActive) throw new AppError(403, "Account deactivated");
+  if (!user.isActive)   throw new AppError(403, "Account deactivated");
   if (user.isSuspended) throw new AppError(403, "Account suspended");
 
-  // Async compare — never blocks the event loop
   const valid = await bcrypt.compare(password, user.passwordHash);
   if (!valid) throw new AppError(401, "Invalid email or password");
 
-  const accessToken = tokenService.signAccessToken(user._id.toString());
+  const accessToken  = tokenService.signAccessToken(user._id.toString());
   const refreshToken = tokenService.signRefreshToken(user._id.toString());
   await tokenService.storeRefreshToken(user._id.toString(), refreshToken);
 
-  // Populate cache so the first authenticated request after login is a cache hit
+  // ✅ No longer errors — setCachedUser now accepts lean objects
   await setCachedUser(user);
 
   sendSuccess(
@@ -283,13 +282,13 @@ export const refresh = asyncHandler(async (req: Request, res: Response) => {
 
   const payload = await tokenService.verifyRefreshToken(refreshToken);
 
-  // Cache-first — same pattern as authenticate middleware
   let user: IUser | CachedUser | null = await getCachedUser(payload.userId);
   if (!user) {
-    const dbUser = await User.findById(payload.userId).lean<IUser>();
+    // ✅ Remove the lying .lean<IUser>() generic — just use plain .lean()
+    const dbUser = await User.findById(payload.userId).lean();
     if (!dbUser) throw new AppError(401, "User not found");
-    await setCachedUser(dbUser);
-    user = dbUser;
+    await setCachedUser(dbUser); // ✅ accepted cleanly now
+    user = dbUser as unknown as CachedUser; // safe: same shape, cache path only
   }
 
   if (!user.isActive)   throw new AppError(403, "Account deactivated");
