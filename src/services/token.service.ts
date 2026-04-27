@@ -38,8 +38,13 @@ export async function storeRefreshToken(userId: string, token: string): Promise<
 
 export async function verifyRefreshToken(token: string): Promise<RefreshTokenPayload> {
   const record = await RefreshToken.findOne({ token });
-  if (!record || record.revoked || record.expiresAt < new Date()) {
+  if (!record || record.expiresAt < new Date()) {
     throw new AppError(401, 'Invalid or expired refresh token');
+  }
+  if (record.revoked) {
+    // Stolen token replay detected — revoke all sessions for this user
+    await revokeAllUserTokens(record.userId).catch(() => null);
+    throw new AppError(401, 'Session expired. Please log in again.', 'TOKEN_REPLAYED');
   }
   try {
     const payload = jwt.verify(token, env.JWT_REFRESH_SECRET) as RefreshTokenPayload;

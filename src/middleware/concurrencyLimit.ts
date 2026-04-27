@@ -1,41 +1,52 @@
-import type { Request, Response, NextFunction } from 'express'; // fix: import types explicitly
+import type { Request, Response, NextFunction } from 'express';
+import { redis } from '../config/redis';
 
-let activeRequests = 0;
 const MAX_CONCURRENT = 30;
+const COUNTER_KEY    = 'concurrency:votes';
+const COUNTER_TTL    = 30; // seconds — safety expiry so a crashed node never permanently blocks
 
-// Track whether we've already decremented for this request.
-// Without this guard, both 'finish' and 'close' firing on the same
-// response would double-decrement activeRequests.
-function decrement(decremented: { done: boolean }): void {
-  if (decremented.done) return;
-  decremented.done = true;
-  activeRequests--;
-}
-
-export function concurrencyLimit(
+export async function concurrencyLimit(
   req:  Request,
   res:  Response,
-  next: NextFunction        // fix: now resolvable via explicit import above
-): void {
-  if (activeRequests >= MAX_CONCURRENT) {
-    // fix: cast to express Response so .status() is the chainable method,
-    // not the numeric property on the raw http.ServerResponse
-    res.status(503).json({
-      success: false,
-      message: 'Server busy, please retry shortly',
-      code:    'CONCURRENCY_LIMIT',
-    });
-    return;
+  next: NextFunction,
+): Promise<void> {
+  let acquired = false;
+
+  try {
+    // Atomic increment — returns the new value
+    const current = await redis.incr(COUNTER_KEY);
+
+    // Set a TTL on first increment so a crashed process never leaves the key stuck
+    if (current === 1) {
+      await redis.expire(COUNTER_KEY, COUNTER_TTL);
+    }
+
+    if (current > MAX_CONCURRENT) {
+      // Over limit — decrement immediately and reject
+      await redis.decr(COUNTER_KEY);
+      res.status(503).json({
+        success: false,
+        message: 'Server busy, please retry shortly',
+        code:    'CONCURRENCY_LIMIT',
+      });
+      return;
+    }
+
+    acquired = true;
+
+    const guard = { done: false };
+    const release = async () => {
+      if (guard.done) return;
+      guard.done = true;
+      await redis.decr(COUNTER_KEY).catch(() => null);
+    };
+
+    res.on('finish', release);
+    res.on('close',  release);
+
+    next();
+  } catch {
+    // Redis unavailable — fail open (don't block the request, just skip the limit)
+    if (!acquired) next();
   }
-
-  activeRequests++;
-  const guard = { done: false };
-
-  // fix: res.on() IS available on Express Response (it extends http.ServerResponse
-  // which extends EventEmitter) — the error was caused by missing @types/express.
-  // Ensure @types/express is in your devDependencies.
-  res.on('finish', () => decrement(guard)); // normal response sent
-  res.on('close',  () => decrement(guard)); // client disconnected early
-
-  next();
 }

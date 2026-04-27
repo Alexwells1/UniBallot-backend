@@ -59,11 +59,12 @@ async function readSession(email: string): Promise<OtpSession | null> {
 }
 
 async function writeSession(email: string, session: OtpSession, ttlSeconds: number): Promise<void> {
-  // H-07: Store OTP in BOTH Redis AND MongoDB
+  // Redis is the primary store — await this
   await redis.setEx(sessionKey(email), ttlSeconds, JSON.stringify(session));
 
+  // MongoDB is crash-recovery backup — fire and forget, do not block the response
   const expiresAt = new Date(session.expiresAt);
-  await OtpVerification.findOneAndUpdate(
+  OtpVerification.findOneAndUpdate(
     { email: email.toLowerCase() },
     {
       $set: {
@@ -76,8 +77,8 @@ async function writeSession(email: string, session: OtpSession, ttlSeconds: numb
         updatedAt:      new Date(session.updatedAt),
       },
     },
-    { upsert: true, new: true }
-  ).catch(() => null);
+    { upsert: true, new: true },
+  ).catch(() => null); // intentionally not awaited
 }
 
 async function deleteSession(email: string): Promise<void> {
@@ -98,8 +99,9 @@ export async function verifyOtp(submitted: string, hash: string): Promise<boolea
 }
 
 /**
- * Creates or resets an OTP session stored in Redis with a 15-minute TTL.
- * Sensitive data never reaches MongoDB — the session is ephemeral by design.
+ * Creates or resets an OTP session stored in both Redis (primary) and MongoDB (fallback).
+ * Redis is the fast read path; MongoDB allows recovery if Redis is flushed or restarted.
+ * TTL matches OTP_EXPIRY_MINUTES (currently 10 minutes).
  *
  * Returns { reused: true } if a valid, unlocked session already exists
  * so the caller can redirect instead of creating a duplicate.
@@ -247,7 +249,7 @@ export async function incrementAttempts(email: string): Promise<void> {
 
 /**
  * Returns a partial session object for the auth controller to validate an OTP.
- * All data is read from Redis — the sole source of truth for OTP sessions.
+ * Reads from Redis first; falls back to MongoDB if Redis misses (see readSession).
  * `attempts` is included so the controller can compute remaining attempts accurately.
  */
 export async function getOtpRecord(email: string): Promise<{
@@ -270,4 +272,16 @@ export async function getOtpRecord(email: string): Promise<{
 
 export async function deleteOtpRecord(email: string): Promise<void> {
   await deleteSession(email);
+}
+
+export async function acquireVerifyLock(lockKey: string, lockValue: string): Promise<boolean> {
+  const acquired = await redis.set(lockKey, lockValue, { NX: true, EX: 10 });
+  return acquired !== null;
+}
+
+export async function releaseVerifyLock(lockKey: string, lockValue: string): Promise<void> {
+  const current = await redis.get(lockKey).catch(() => null);
+  if (current === lockValue) {
+    await redis.del(lockKey).catch(() => null);
+  }
 }

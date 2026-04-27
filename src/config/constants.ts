@@ -58,4 +58,5 @@ export const AUDIT_ACTIONS = {
   SEMESTER_RESET_INITIATED: 'semester_reset_initiated',
   SEMESTER_RESET_COMPLETED: 'semester_reset_completed',
   INTEGRITY_CHECK_RUN:      'integrity_check_run',
+  CACHE_FLUSHED:'cache_flushed',
 } as const;

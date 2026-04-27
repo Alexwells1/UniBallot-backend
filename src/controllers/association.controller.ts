@@ -2,6 +2,9 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import Association from '../models/Association';
 import Election from '../models/Election';
+import Office from '../models/Office';
+import Candidate from '../models/Candidate';
+import RegisteredVoter from '../models/RegisteredVoter';
 import { AppError } from '../utils/AppError';
 import { asyncHandler } from '../utils/asyncHandler';
 import { sendSuccess } from '../utils/apiResponse';
@@ -12,6 +15,11 @@ export const associationSchema = z.object({
   name:        z.string().min(2),
   description: z.string().optional(),
 });
+
+export const updateAssociationSchema = z.object({
+  name:        z.string().min(2).max(100).optional(),
+  description: z.string().max(500).optional(),
+}).strict();
 
 export const createAssociation = asyncHandler(async (req: Request, res: Response) => {
   const { name, description } = req.body as z.infer<typeof associationSchema>;
@@ -89,7 +97,24 @@ export const deleteAssociation = asyncHandler(async (req: Request, res: Response
     throw new AppError(409, 'Cannot delete an association with non-draft elections');
   }
 
-  await Association.findByIdAndDelete(association._id);
+  // Delete all draft elections (and their offices/candidates) for this association
+  const draftElections = await Election.find({
+    associationId: association._id,
+    status: 'draft',
+  }).select('_id').lean();
+
+  if (draftElections.length > 0) {
+    const draftIds = draftElections.map(e => e._id);
+    await Promise.all([
+      Office.deleteMany({ electionId: { $in: draftIds } }),
+      Candidate.deleteMany({ electionId: { $in: draftIds } }),
+      RegisteredVoter.deleteMany({ electionId: { $in: draftIds } }),
+      Election.deleteMany({ _id: { $in: draftIds } }),
+    ]);
+  }
+
+  // Now delete the association
+  await association.deleteOne();
   await logAction({
     action:      AUDIT_ACTIONS.ASSOCIATION_DELETED,
     performedBy: req.user._id,

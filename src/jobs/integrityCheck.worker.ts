@@ -15,6 +15,7 @@ import { Worker, Job } from 'bullmq';
 import mongoose from 'mongoose';
 import { env } from '../config/env';
 import Vote from '../models/Vote';
+import RegisteredVoter from '../models/RegisteredVoter';
 import Election from '../models/Election';
 import { logAction } from '../services/audit.service';
 import { AUDIT_ACTIONS } from '../config/constants';
@@ -74,6 +75,28 @@ async function processIntegrityCheck(
     tampered:    tamperedIds.length,
     tamperedIds,
   };
+
+  // Integrity check: every voter marked hasVoted:true must have at least one Vote document
+  const voterCount = await RegisteredVoter.countDocuments({ electionId: election._id, hasVoted: true });
+  const voteCount  = await Vote.countDocuments({ electionId: election._id });
+
+  if (voteCount < voterCount) {
+    console.error(
+      `[integrity] ⚠️ MISMATCH electionId=${electionId} | voters with hasVoted=true: ${voterCount} | vote documents: ${voteCount} | missing: ${voterCount - voteCount}`
+    );
+    await logAction({
+      action:      AUDIT_ACTIONS.INTEGRITY_CHECK_RUN,
+      performedBy: new mongoose.Types.ObjectId(requestedBy),
+      targetId:    election._id,
+      targetModel: 'Election',
+      metadata: {
+        type: 'INTEGRITY_CHECK_FAILED',
+        voterCount,
+        voteCount,
+        delta: voterCount - voteCount,
+      },
+    });
+  }
 
   // Persist result on the Election document for fast retrieval
   await Election.findByIdAndUpdate(electionId, {

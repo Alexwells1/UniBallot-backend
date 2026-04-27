@@ -64,16 +64,29 @@ function makeLimiter(
   };
 }
 
-export const registrationLimiter = makeLimiter('rl:reg:',     100000,  'Too many registration attempts, please try again later');
-export const loginLimiter         = makeLimiter('rl:login:',   100000,  'Too many login attempts, please try again later');
-export const otpLimiter           = makeLimiter('rl:otp:',      50000,  'Too many OTP attempts, please try again later');
-export const votingLimiter        = makeLimiter('rl:vote:',     50000,  'Too many voting requests, please try again later');
-export const refreshLimiter       = makeLimiter('rl:refresh:', 200000,  'Too many token refresh attempts');
-export const generalLimiter       = makeLimiter('rl:general:', 200000, 'Too many requests, please slow down');
-export const receiptLimiter       = makeLimiter('rl:receipt:', 100000,  'Too many receipt verification attempts, please try again later');
+// 10 registrations per IP per 15 min
+export const registrationLimiter = makeLimiter('rl:reg:',     10,  'Too many registration attempts, please try again later', 15 * 60_000);
+// 20 logins per IP per 15 min
+export const loginLimiter         = makeLimiter('rl:login:',   20,  'Too many login attempts, please try again later', 15 * 60_000);
+// 10 OTP attempts per IP per 10 min
+export const otpLimiter           = makeLimiter('rl:otp:',     10,  'Too many OTP attempts, please try again later', 10 * 60_000);
+// 30 vote requests per IP per minute
+export const votingLimiter        = makeLimiter('rl:vote:',    30,  'Too many voting requests, please try again later');
+// 60 token refreshes per IP per 15 min
+export const refreshLimiter       = makeLimiter('rl:refresh:', 60,  'Too many token refresh attempts', 15 * 60_000);
+// 200 general requests per IP per minute
+export const generalLimiter       = makeLimiter('rl:general:', 200, 'Too many requests, please slow down');
+// 30 receipt verifications per IP per minute
+export const receiptLimiter       = makeLimiter('rl:receipt:', 30,  'Too many receipt verification attempts, please try again later');
 
 /**
- * F-11: Election code lookups are unauthenticated and short-code brute-forceable.
+ * Election code lookups are unauthenticated and short-code brute-forceable.
  * 10 requests per minute per IP limits enumeration to a crawl.
  */
-export const codeLookupLimiter = makeLimiter('rl:code:', 100000, 'Too many election code lookups, please try again later');
+export const codeLookupLimiter = makeLimiter('rl:code:', 10, 'Too many election code lookups, please try again later');
+
+// 5 uploads per user per minute
+export const uploadLimiter = makeLimiter('rl:upload:', 5, 'Too many upload attempts, please wait before uploading again');
+
+// 30 public election lookups per IP per minute
+export const publicElectionLimiter = makeLimiter('rl:pubElection:', 30, 'Too many requests, please slow down');

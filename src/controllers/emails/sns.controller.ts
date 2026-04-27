@@ -1,70 +1,80 @@
 import { EmailLog } from "../../models/Emaillog";
 import { SuppressedAddress } from "../../models/Suppressedaddress";
+import { z } from 'zod';
+import { AppError } from '../../utils/AppError';
 
-export const parseSNSBody = (body: any): any => {
-  if (typeof body === 'string') {
-    try {
-      return JSON.parse(body);
-    } catch {
-      return null;
-    }
-  }
-  return body ?? null;
+/**
+ * Resend sends webhook events as JSON POST bodies.
+ * Relevant event types: email.bounced, email.complained
+ * Docs: https://resend.com/docs/dashboard/webhooks/event-types
+ */
+const ResendWebhookEventSchema = z.object({
+  type: z.string(),
+  data: z.object({
+    to: z.array(z.string().email()).optional().default([]),
+  }).optional().default({ to: [] }),
+});
+
+export type ResendWebhookEvent = z.infer<typeof ResendWebhookEventSchema>;
+
+export const parseResendWebhookBody = (body: unknown): ResendWebhookEvent | null => {
+  const parsed = ResendWebhookEventSchema.safeParse(
+    typeof body === 'string' ? JSON.parse(body) : body
+  );
+  return parsed.success ? parsed.data : null;
 };
 
-export const handleSNSMessage = async (snsMessage: any) => {
-  if (!snsMessage) throw new Error('Invalid SNS message');
+export const handleResendWebhook = async (event: ResendWebhookEvent | null) => {
+  if (!event) throw new AppError(400, 'Invalid Resend webhook payload');
 
-  // Subscription confirmation
-  if (snsMessage.Type === 'SubscriptionConfirmation') {
-    console.log('[SNS] Subscription confirmation URL:', snsMessage.SubscribeURL);
-    return { type: 'subscription', message: 'Confirmation URL logged' };
+  const type: string = event.type;
+
+  if (type === 'email.bounced') {
+    await handleBounce(event);
+    return { type: 'bounce', message: 'Processed' };
   }
 
-  // Only process notifications
-  if (snsMessage.Type !== 'Notification') {
-    return { type: 'ignored', message: 'Ignored non-notification message' };
+  if (type === 'email.complained') {
+    await handleComplaint(event);
+    return { type: 'complaint', message: 'Processed' };
   }
 
-  const notification = JSON.parse(snsMessage.Message);
-  const notifType: string = notification.notificationType;
-
-  if (notifType === 'Bounce') await handleBounce(notification);
-  else if (notifType === 'Complaint') await handleComplaint(notification);
-
-  return { type: 'notification', message: 'Processed' };
+  // Other event types (delivered, opened, clicked) — no action needed
+  return { type: 'ignored', message: `Ignored event type: ${type}` };
 };
 
-const handleBounce = async (notification: any) => {
-  const bouncedRecipients = notification.bounce?.bouncedRecipients ?? [];
-  for (const recipient of bouncedRecipients) {
-    const email = recipient.emailAddress.toLowerCase();
+const handleBounce = async (event: ResendWebhookEvent) => {
+  // Resend bounce payload: event.data.to is an array of recipient emails
+  const recipients: string[] = event.data?.to ?? [];
+  for (const email of recipients) {
+    const normalised = email.toLowerCase();
     await SuppressedAddress.findOneAndUpdate(
-      { email },
-      { email, reason: 'bounce' },
+      { email: normalised },
+      { email: normalised, reason: 'bounce' },
       { upsert: true, new: true }
     );
     await EmailLog.updateMany(
-      { to: email },
+      { to: normalised },
       { $set: { bouncedAt: new Date() } }
     );
-    console.log(`[SNS] Bounce recorded for ${email}`);
+    console.log(`[resend-webhook] Bounce recorded for ${normalised}`);
   }
 };
 
-const handleComplaint = async (notification: any) => {
-  const complainedRecipients = notification.complaint?.complainedRecipients ?? [];
-  for (const recipient of complainedRecipients) {
-    const email = recipient.emailAddress.toLowerCase();
+const handleComplaint = async (event: ResendWebhookEvent) => {
+  // Resend complaint payload: event.data.to is an array of recipient emails
+  const recipients: string[] = event.data?.to ?? [];
+  for (const email of recipients) {
+    const normalised = email.toLowerCase();
     await SuppressedAddress.findOneAndUpdate(
-      { email },
-      { email, reason: 'complaint' },
+      { email: normalised },
+      { email: normalised, reason: 'complaint' },
       { upsert: true, new: true }
     );
     await EmailLog.updateMany(
-      { to: email },
+      { to: normalised },
       { $set: { complaintAt: new Date() } }
     );
-    console.log(`[SNS] Complaint recorded for ${email}`);
+    console.log(`[resend-webhook] Complaint recorded for ${normalised}`);
   }
 };

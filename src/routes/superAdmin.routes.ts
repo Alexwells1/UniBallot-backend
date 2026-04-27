@@ -19,6 +19,7 @@ import {
   clearTallyCache,
   clearUserCache,
   getCacheStats,
+  flushCache,           flushCacheSchema,
 } from '../controllers/superAdmin.controller';
 import { assignOfficer } from '../controllers/election.controller';
 
@@ -49,9 +50,10 @@ router.patch('/users/:id/activate',       activateUser);
 router.delete('/users/:id',               deleteUser);
 router.patch('/users/:id/reset-password', validate(resetPasswordSchema), resetPassword);
 
-// Cache management (F-08)
+// Cache management
 router.post('/cache/clear-tally/:electionId', clearTallyCache);
 router.post('/cache/clear-user/:userId',      clearUserCache);
 router.get('/cache/stats',                    getCacheStats);
+router.post('/cache/flush',                   validate(flushCacheSchema), flushCache);
 
 export default router;

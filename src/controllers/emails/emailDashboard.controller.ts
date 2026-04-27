@@ -41,7 +41,10 @@ export const getDashboardStats = async () => {
 export const getEmailLogs = async (page = 1, limit = 20, status?: string, to?: string) => {
   const filter: Record<string, any> = {};
   if (status) filter.status = status;
-  if (to)     filter.to = { $regex: to, $options: 'i' };
+  if (to) {
+    const safeTo = to.replace(/[.*+?^${}()|[\]\\]/g, '\\&');
+    filter.to = { $regex: safeTo, $options: 'i' };
+  }
 
   const [logs, total] = await Promise.all([
     EmailLog.find(filter)

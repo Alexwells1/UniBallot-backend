@@ -1,48 +1,57 @@
-import { Request, Response } from 'express';
-import { z } from 'zod';
-import mongoose from 'mongoose';
-import Election from '../models/Election';
-import AssociationMember from '../models/AssociationMember';
-import RegisteredVoter from '../models/RegisteredVoter';
-import { AppError } from '../utils/AppError';
-import { asyncHandler } from '../utils/asyncHandler';
-import { sendSuccess, sendPaginated } from '../utils/apiResponse';
-import { processMembersCsv } from '../services/csv.service';
-import { logAction } from '../services/audit.service';
-import { AUDIT_ACTIONS, MATRIC_NUMBER_REGEX } from '../config/constants';
+import { Request, Response } from "express";
+import { z } from "zod";
+import mongoose from "mongoose";
+import Election from "../models/Election";
+import AssociationMember from "../models/AssociationMember";
+import RegisteredVoter from "../models/RegisteredVoter";
+import { AppError } from "../utils/AppError";
+import { asyncHandler } from "../utils/asyncHandler";
+import { sendSuccess } from "../utils/apiResponse";
+import { processMembersCsv } from "../services/csv.service";
+import { logAction } from "../services/audit.service";
+import { AUDIT_ACTIONS, MATRIC_NUMBER_REGEX } from "../config/constants";
 
 // ─── Upload ────────────────────────────────────────────────────────────────────
 
-export const uploadMembers = asyncHandler(async (req: Request, res: Response) => {
-  const election = await Election.findById(req.params.id);
-  if (!election) throw new AppError(404, 'Election not found');
-  if (election.status !== 'setup')
-    throw new AppError(400, 'Members can only be uploaded in setup status');
-  if (election.membersLocked) throw new AppError(409, 'Member list is locked');
-  if (!req.file)
-    throw new AppError(400, 'No CSV file provided (form field name: "file")');
+export const uploadMembers = asyncHandler(
+  async (req: Request, res: Response) => {
+    const election = await Election.findById(req.params.id);
+    if (!election) throw new AppError(404, "Election not found");
+    if (election.status !== "setup")
+      throw new AppError(400, "Members can only be uploaded in setup status");
+    if (election.membersLocked)
+      throw new AppError(409, "Member list is locked");
+    if (!req.file)
+      throw new AppError(400, 'No CSV file provided (form field name: "file")');
 
-  const report = await processMembersCsv(req.file.buffer, election._id.toString());
+    const report = await processMembersCsv(
+      req.file.buffer,
+      election._id.toString(),
+    );
 
-  await logAction({
-    action:      AUDIT_ACTIONS.MEMBERS_UPLOADED,
-    performedBy: req.user._id,
-    targetId:    election._id,
-    targetModel: 'Election',
-    metadata:    { inserted: report.inserted, invalid: report.invalid },
-  });
+    await logAction({
+      action: AUDIT_ACTIONS.MEMBERS_UPLOADED,
+      performedBy: req.user._id,
+      targetId: election._id,
+      targetModel: "Election",
+      metadata: { inserted: report.inserted, invalid: report.invalid },
+    });
 
-  sendSuccess(res, report, 'CSV processed');
-});
+    sendSuccess(res, report, "CSV processed");
+  },
+);
 
 // ─── List ──────────────────────────────────────────────────────────────────────
 
 export const listMembers = asyncHandler(async (req: Request, res: Response) => {
   // H-05: Implement cursor-based pagination
-  const limitNum = Math.min(200, Math.max(1, parseInt(req.query.limit as string || '50', 10)));
-  const cursor   = req.query.cursor as string | undefined;
+  const limitNum = Math.min(
+    200,
+    Math.max(1, parseInt((req.query.limit as string) || "50", 10)),
+  );
+  const cursor = req.query.cursor as string | undefined;
 
-  const search = (req.query.search as string || '').trim();
+  const search = ((req.query.search as string) || "").trim();
   const filter: Record<string, unknown> = { electionId: req.params.id };
 
   if (cursor && mongoose.Types.ObjectId.isValid(cursor)) {
@@ -51,14 +60,16 @@ export const listMembers = asyncHandler(async (req: Request, res: Response) => {
 
   if (search) {
     // H-11: Anchored regex for search filtering
-    const escaped = search.slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    filter.matricNumber = { $regex: '^' + escaped, $options: 'i' };
+    const escaped = search.slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    filter.matricNumber = { $regex: "^" + escaped, $options: "i" };
   }
 
-  const members = await AssociationMember.find(filter).limit(limitNum + 1).sort({ _id: 1 });
+  const members = await AssociationMember.find(filter)
+    .limit(limitNum + 1)
+    .sort({ _id: 1 });
 
-  const hasMore    = members.length > limitNum;
-  const data       = hasMore ? members.slice(0, limitNum) : members;
+  const hasMore = members.length > limitNum;
+  const data = hasMore ? members.slice(0, limitNum) : members;
   const nextCursor = hasMore ? data[data.length - 1]._id.toString() : null;
 
   sendSuccess(res, { data, nextCursor, hasMore });
@@ -68,110 +79,127 @@ export const listMembers = asyncHandler(async (req: Request, res: Response) => {
 
 export const getMember = asyncHandler(async (req: Request, res: Response) => {
   const member = await AssociationMember.findOne({
-    _id:        req.params.memberId,
+    _id: req.params.memberId,
     electionId: req.params.id,
   });
-  if (!member) throw new AppError(404, 'Member not found');
+  if (!member) throw new AppError(404, "Member not found");
   sendSuccess(res, member);
 });
 
 // ─── Update ────────────────────────────────────────────────────────────────────
 
 const updateMemberSchema = z.object({
-  matricNumber: z.string().regex(MATRIC_NUMBER_REGEX, 'Invalid matric number format'),
+  matricNumber: z
+    .string()
+    .regex(MATRIC_NUMBER_REGEX, "Invalid matric number format"),
 });
 
-export const updateMember = asyncHandler(async (req: Request, res: Response) => {
-  const election = await Election.findById(req.params.id);
-  if (!election) throw new AppError(404, 'Election not found');
-  if (election.status !== 'setup')
-    throw new AppError(400, 'Members can only be edited in setup status');
-  if (election.membersLocked) throw new AppError(409, 'Member list is locked');
+export const updateMember = asyncHandler(
+  async (req: Request, res: Response) => {
+    const election = await Election.findById(req.params.id);
+    if (!election) throw new AppError(404, "Election not found");
+    if (election.status !== "setup")
+      throw new AppError(400, "Members can only be edited in setup status");
+    if (election.membersLocked)
+      throw new AppError(409, "Member list is locked");
 
-  const parsed = updateMemberSchema.safeParse(req.body);
-  if (!parsed.success)
-    throw new AppError(400, parsed.error.errors[0].message);
+    const parsed = updateMemberSchema.safeParse(req.body);
+    if (!parsed.success)
+      throw new AppError(400, parsed.error.errors[0].message);
 
-  const { matricNumber } = parsed.data;
+    const { matricNumber } = parsed.data;
 
-  // Check uniqueness within the same election
-  const conflict = await AssociationMember.findOne({
-    electionId:   req.params.id,
-    matricNumber: matricNumber.trim(),
-    _id:          { $ne: req.params.memberId },
-  });
-  if (conflict) throw new AppError(409, 'Matric number already exists in this election');
+    // Check uniqueness within the same election
+    const conflict = await AssociationMember.findOne({
+      electionId: req.params.id,
+      matricNumber: matricNumber.trim(),
+      _id: { $ne: req.params.memberId },
+    });
+    if (conflict)
+      throw new AppError(409, "Matric number already exists in this election");
 
-  const update: Record<string, string> = {};
-  update.matricNumber = matricNumber.trim();
+    const update: Record<string, string> = {};
+    update.matricNumber = matricNumber.trim();
 
-  const member = await AssociationMember.findOneAndUpdate(
-    { _id: req.params.memberId, electionId: req.params.id },
-    { $set: update },
-    { new: true },
-  );
-  if (!member) throw new AppError(404, 'Member not found');
+    const member = await AssociationMember.findOneAndUpdate(
+      { _id: req.params.memberId, electionId: req.params.id },
+      { $set: update },
+      { new: true },
+    );
+    if (!member) throw new AppError(404, "Member not found");
 
-  await logAction({
-    action:      AUDIT_ACTIONS.MEMBER_UPDATED,
-    performedBy: req.user._id,
-    targetId:    member._id,
-    targetModel: 'AssociationMember',
-    metadata:    update,
-  });
+    await logAction({
+      action: AUDIT_ACTIONS.MEMBER_UPDATED,
+      performedBy: req.user._id,
+      targetId: member._id,
+      targetModel: "AssociationMember",
+      metadata: update,
+    });
 
-  sendSuccess(res, member, 'Member updated');
-});
+    sendSuccess(res, member, "Member updated");
+  },
+);
 
 // ─── Delete ────────────────────────────────────────────────────────────────────
 
-export const deleteMember = asyncHandler(async (req: Request, res: Response) => {
-  const election = await Election.findById(req.params.id);
-  if (!election) throw new AppError(404, 'Election not found');
-  if (election.status !== 'setup')
-    throw new AppError(400, 'Members can only be deleted in setup status');
-  if (election.membersLocked) throw new AppError(409, 'Member list is locked');
+export const deleteMember = asyncHandler(
+  async (req: Request, res: Response) => {
+    const election = await Election.findById(req.params.id);
+    if (!election) throw new AppError(404, "Election not found");
+    if (election.status !== "setup")
+      throw new AppError(400, "Members can only be deleted in setup status");
+    if (election.membersLocked)
+      throw new AppError(409, "Member list is locked");
 
-  const member = await AssociationMember.findOneAndDelete({
-    _id:        req.params.memberId,
-    electionId: req.params.id,
-  });
-  if (!member) throw new AppError(404, 'Member not found');
+    const member = await AssociationMember.findOneAndDelete({
+      _id: req.params.memberId,
+      electionId: req.params.id,
+    });
+    if (!member) throw new AppError(404, "Member not found");
 
-  await logAction({
-    action:      AUDIT_ACTIONS.MEMBER_DELETED,
-    performedBy: req.user._id,
-    targetId:    member._id,
-    targetModel: 'AssociationMember',
-    metadata:    { matricNumber: member.matricNumber },
-  });
+    await logAction({
+      action: AUDIT_ACTIONS.MEMBER_DELETED,
+      performedBy: req.user._id,
+      targetId: member._id,
+      targetModel: "AssociationMember",
+      metadata: { matricNumber: member.matricNumber },
+    });
 
-  sendSuccess(res, null, 'Member deleted');
-});
+    sendSuccess(res, null, "Member deleted");
+  },
+);
 
 // ─── Clear all ─────────────────────────────────────────────────────────────────
 
-export const clearMembers = asyncHandler(async (req: Request, res: Response) => {
-  const election = await Election.findById(req.params.id);
-  if (!election) throw new AppError(404, 'Election not found');
-  if (election.status !== 'setup')
-    throw new AppError(400, 'Members can only be cleared in setup status');
-  if (election.membersLocked) throw new AppError(409, 'Member list is locked');
+export const clearMembers = asyncHandler(
+  async (req: Request, res: Response) => {
+    const election = await Election.findById(req.params.id);
+    if (!election) throw new AppError(404, "Election not found");
+    if (election.status !== "setup")
+      throw new AppError(400, "Members can only be cleared in setup status");
+    if (election.membersLocked)
+      throw new AppError(409, "Member list is locked");
 
-  // H-06: Before clearing members, check for registered voters
-  const registeredVoterCount = await RegisteredVoter.countDocuments({ electionId: election._id });
-  if (registeredVoterCount > 0) {
-    throw new AppError(409, `Cannot clear members: ${registeredVoterCount} voter(s) are already registered for this election`);
-  }
+    // H-06: Before clearing members, check for registered voters
+    const registeredVoterCount = await RegisteredVoter.countDocuments({
+      electionId: election._id,
+    });
+    if (registeredVoterCount > 0) {
+      throw new AppError(
+        409,
+        `Cannot clear members: ${registeredVoterCount} voter(s) are already registered for this election`,
+      );
+    }
 
-  await AssociationMember.deleteMany({ electionId: election._id });
+    await AssociationMember.deleteMany({ electionId: election._id });
 
-  await logAction({
-    action:      AUDIT_ACTIONS.MEMBERS_CLEARED,
-    performedBy: req.user._id,
-    targetId:    election._id,
-    targetModel: 'Election',
-  });
+    await logAction({
+      action: AUDIT_ACTIONS.MEMBERS_CLEARED,
+      performedBy: req.user._id,
+      targetId: election._id,
+      targetModel: "Election",
+    });
 
-  sendSuccess(res, null, 'Member list cleared');
-});
+    sendSuccess(res, null, "Member list cleared");
+  },
+);

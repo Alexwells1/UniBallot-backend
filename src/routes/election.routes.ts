@@ -10,6 +10,7 @@ import {
   votingLimiter,
   receiptLimiter,
   codeLookupLimiter,
+  publicElectionLimiter,
 } from "../middleware/rateLimiter";
 
 import {
@@ -107,7 +108,7 @@ router.get(
   authorize("super_admin", "officer"),
   listElections,
 );
-router.get("/open", getOpenElections);
+router.get("/open", publicElectionLimiter, getOpenElections);
 router.get("/my", authenticate, authorize("student"), listMyElections);
 
 router.get("/:id/receipt/:code", receiptLimiter, verifyReceipt);
@@ -194,12 +195,11 @@ router.delete(
 );
 
 router.get("/:id/ballot", authenticate, authorize("student"), getBallotHandler);
-// In election.routes.ts — move concurrencyLimit FIRST
 router.post(
   "/:id/vote",
-  concurrencyLimit, 
   authenticate,
   authorize("student"),
+  concurrencyLimit,
   votingLimiter,
   validate(voteSubmissionSchema),
   submitBallotHandler,

@@ -80,6 +80,37 @@ async function getBallotData(electionId: string): Promise<BallotData> {
   return data;
 }
 
+// ── Voter registration cache ──────────────────────────────────────────────────
+
+const VOTER_CACHE_TTL = 3600; // 1 hour
+
+async function isVoterRegistered(
+  electionId: string,
+  userId: string,
+): Promise<{ registered: boolean; hasVoted: boolean }> {
+  const key = `voter:${electionId}:${userId}`;
+  try {
+    const cached = await redis.get(key);
+    if (cached) return JSON.parse(cached);
+  } catch { /* fall through */ }
+
+  const voter = await RegisteredVoter.findOne(
+    { electionId, userId },
+    { hasVoted: 1 },
+  ).lean();
+
+  const result = voter
+    ? { registered: true,  hasVoted: voter.hasVoted }
+    : { registered: false, hasVoted: false };
+
+  // Only cache if registered — unregistered users shouldn't get a stale negative cache
+  if (result.registered) {
+    await redis.setEx(key, VOTER_CACHE_TTL, JSON.stringify(result)).catch(() => null);
+  }
+
+  return result;
+}
+
 // ── Get Ballot ────────────────────────────────────────────────────────────────
 
 export async function getBallot(electionId: string, userId: string) {
@@ -88,9 +119,9 @@ export async function getBallot(electionId: string, userId: string) {
   if (election.status !== 'voting_open') throw new AppError(400, 'Voting is not open');
   if (election.isLocked) throw new AppError(423, 'Election is in lockdown');
 
-  const voter = await RegisteredVoter.findOne({ electionId, userId }).lean();
-  if (!voter) throw new AppError(403, 'You are not registered for this election');
-  if (voter.hasVoted) throw new AppError(409, 'You have already voted');
+  const voterStatus = await isVoterRegistered(electionId, userId);
+  if (!voterStatus.registered) throw new AppError(403, 'You are not registered for this election');
+  if (voterStatus.hasVoted) throw new AppError(409, 'You have already voted');
 
   const candidatesByOffice = new Map<string, typeof candidates>();
   for (const c of candidates) {
@@ -143,15 +174,16 @@ async function _submitBallot(
   votes:      VoteSubmission[]
 ): Promise<{ receiptCode: string }> {
 
-  // ── Step 1: Fast exit — check voter status BEFORE any other DB work ───────
-  // During spike tests many accounts have already voted. This check exits
-  // in ~5ms without touching election, offices, candidates, or a session.
-  const voterCheck = await RegisteredVoter.findOne(
-    { electionId, userId },
-    { hasVoted: 1 }
-  ).lean();
+  // Step 1: Fast-path early exit — checks Redis voter cache.
+  // THIS IS NOT THE AUTHORITATIVE DOUBLE-VOTE GUARD.
+  // Two concurrent requests can both pass this check if the cache
+  // hasn't been updated yet. The authoritative guard is Step 7:
+  // findOneAndUpdate({ hasVoted: false }) which is atomic at the MongoDB
+  // document level. This check exists only to save DB and p-limit resources
+  // for the common case (voter loads ballot, votes, done).
+  const voterCheck = await isVoterRegistered(electionId, userId);
 
-  if (!voterCheck) throw new AppError(403, 'You are not registered for this election');
+  if (!voterCheck.registered) throw new AppError(403, 'You are not registered for this election');
   if (voterCheck.hasVoted) throw new AppError(409, 'You have already voted');
 
   // ── Step 2: Load election + offices + candidates from Redis cache ─────────
@@ -184,8 +216,11 @@ async function _submitBallot(
     candidatesByOffice.get(c.officeId)!.push(c);
   }
 
+  // Build office map for O(1) lookup — mirrors candidatesByOffice pattern
+  const officeMap = new Map(offices.map((o) => [o._id, o]));
+
   for (const vote of votes) {
-    const office = offices.find((o) => o._id === vote.officeId);
+    const office = officeMap.get(vote.officeId);
     if (!office) throw new AppError(400, `Unknown officeId: ${vote.officeId}`);
 
     const officeCandidates = candidatesByOffice.get(office._id) ?? [];
@@ -224,28 +259,10 @@ async function _submitBallot(
     };
   });
 
-  // ── Step 6: Atomic double-vote guard — NO session/transaction needed ──────
-  // findOneAndUpdate is atomic at the document level. A session wrapping this
-  // single-document update adds oplog coordination overhead (~6–8s on Atlas
-  // free tier) with no correctness benefit. The unique index on votes
-  // (electionId + officeId + ballotToken) is the safety net against any
-  // race-condition duplicate inserts.
-  const voter = await RegisteredVoter.findOneAndUpdate(
-    { electionId, userId, hasVoted: false },
-    { $set: { hasVoted: true, ballotToken, receiptCode, votedAt: submittedAt } },
-    { new: false }
-  );
-
-  if (!voter) {
-    // Re-read to distinguish "not registered" from "already voted" race
-    const existing = await RegisteredVoter.findOne({ electionId, userId }).lean();
-    if (!existing) throw new AppError(403, 'You are not registered for this election');
-    throw new AppError(409, 'You have already voted');
-  }
-
-  // ── Step 7: Insert vote documents ────────────────────────────────────────
-  // ordered: false — insert all documents in parallel; if any duplicate key
-  // error fires (ballotToken collision), catch it as VOTE_ALREADY_RECORDED.
+  // ── Step 6: Insert vote documents FIRST — if this fails, voter can retry ──
+  // (hasVoted still false). The unique index on (electionId, officeId, ballotToken)
+  // makes this idempotent — a retry after a crash will produce duplicate key errors
+  // which we treat as a safe no-op / 409.
   try {
     await Vote.insertMany(voteDocs, { ordered: false });
   } catch (err) {
@@ -260,6 +277,29 @@ async function _submitBallot(
     if (isDupKey(err)) throw new AppError(409, 'Your vote was already recorded', 'VOTE_ALREADY_RECORDED');
     throw err;
   }
+
+  // ── Step 7: Mark voter as having voted — this is the point of no return ──
+  // findOneAndUpdate is atomic at the document level. A session wrapping this
+  // single-document update adds oplog coordination overhead (~6–8s on Atlas
+  // free tier) with no correctness benefit.
+  const votedVoter = await RegisteredVoter.findOneAndUpdate(
+    { electionId, userId, hasVoted: false },
+    { $set: { hasVoted: true, ballotToken, receiptCode, votedAt: submittedAt } },
+    { new: true }
+  );
+
+  if (!votedVoter) {
+    // Vote documents were inserted but voter was already marked — duplicate vote
+    // The unique index on Vote prevented double-insertion; safe to reject
+    throw new AppError(409, 'You have already voted in this election');
+  }
+
+  // Update voter cache to reflect hasVoted: true
+  await redis.setEx(
+    `voter:${electionId}:${userId}`,
+    VOTER_CACHE_TTL,
+    JSON.stringify({ registered: true, hasVoted: true }),
+  ).catch(() => null);
 
   // ── Step 8: Audit log (fire-and-forget — non-critical) ───────────────────
   logAction({

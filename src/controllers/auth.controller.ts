@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
 import User from "../models/User";
@@ -10,7 +11,8 @@ import * as otpService from "../services/otp.service";
 import * as emailService from "../services/email/email.service";
 import { logAction } from "../services/audit.service";
 import { AUDIT_ACTIONS, OTP_MAX_ATTEMPTS } from "../config/constants";
-import { invalidateCachedUser } from "../services/userCache.service";
+import { getCachedUser, setCachedUser, invalidateCachedUser, CachedUser } from "../services/userCache.service";
+import type { IUser } from "../models/User";
 import { sanitizeUser } from "../utils/sanitize";
 
 // ── Zod schemas ───────────────────────────────────────────────────────────────
@@ -55,11 +57,24 @@ export const register = asyncHandler(async (req: Request, res: Response) => {
   const { email, password } = req.body as z.infer<typeof registerSchema>;
   const normalised = email.toLowerCase();
 
-  const existing = await User.findOne({ email: normalised });
-  if (existing)
-    throw new AppError(409, "An account with this email already exists");
+  // Step 1: Check both in parallel — DB user existence + Redis OTP status
+  const [existing, otpStatus] = await Promise.all([
+    User.findOne({ email: normalised }),
+    otpService.getOtpStatus(normalised),
+  ]);
 
-  // Cost 10 — ~65ms per hash on modern hardware. Async, never blocks event loop.
+  if (existing) throw new AppError(409, 'An account with this email already exists');
+
+  // Step 2: Bail early BEFORE hashing if a valid OTP session already exists
+  if (otpStatus.exists && !otpStatus.expired && !otpStatus.locked) {
+    throw new AppError(
+      409,
+      'A verification code was already sent to this email. Use the resend option if you need a new one.',
+      'OTP_ALREADY_SENT',
+    );
+  }
+
+  // Step 3: Only hash when we know we'll use it
   const passwordHash = await bcrypt.hash(password, 10);
 
   const result = await otpService.createOtpRecord(normalised, passwordHash);
@@ -67,45 +82,43 @@ export const register = asyncHandler(async (req: Request, res: Response) => {
   if (result.reused) {
     throw new AppError(
       409,
-      "A verification code was already sent to this email. Use the resend option if you need a new one.",
-      "OTP_ALREADY_SENT",
+      'A verification code was already sent to this email. Use the resend option if you need a new one.',
+      'OTP_ALREADY_SENT',
     );
   }
 
   const template = emailService.otpEmailTemplate(result.otp);
   await emailService.sendEmail({ to: normalised, ...template });
 
-  sendSuccess(res, null, "Check your email for a verification code", 201);
+  sendSuccess(res, null, 'Check your email for a verification code', 201);
 });
 
 export const resendOtp = asyncHandler(async (req: Request, res: Response) => {
   const { email } = req.body as z.infer<typeof resendOtpSchema>;
   const normalised = email.toLowerCase();
 
-  const existing = await User.findOne({ email: normalised });
+  // Run both checks in parallel
+  const [existing, newOtp] = await Promise.all([
+    User.findOne({ email: normalised }).lean(),
+    otpService.resendOtp(normalised).catch((err) => { throw err; }),
+  ]);
+
   if (existing) {
     throw new AppError(
       409,
-      "An account with this email already exists. Please log in instead.",
-      "USER_EXISTS",
+      'An account with this email already exists. Please log in instead.',
+      'USER_EXISTS',
     );
   }
 
-  const newOtp = await otpService.resendOtp(normalised);
-
-  const template = emailService.otpEmailTemplate(newOtp);
+  const template = emailService.otpEmailTemplate(newOtp as string);
   await emailService.sendEmail({
     to: normalised,
     ...template,
-    subject: "Your New Verification Code",
+    subject: 'Your New Verification Code',
   });
 
-  sendSuccess(
-    res,
-    null,
-    "A new verification code has been sent to your email",
-    200,
-  );
+  sendSuccess(res, null, 'A new verification code has been sent to your email', 200);
 });
 
 export const otpStatus = asyncHandler(async (req: Request, res: Response) => {
@@ -148,47 +161,56 @@ export const verifyOtp = asyncHandler(async (req: Request, res: Response) => {
     );
   }
 
-  const valid = await otpService.verifyOtp(otp, record.otpHash);
-  if (!valid) {
-    await otpService.incrementAttempts(normalised);
+  // Acquire Redis mutex to prevent concurrent OTP verification for the same email
+  const lockKey   = `otp-verify-lock:${normalised}`;
+  const lockValue = crypto.randomUUID();
+  const acquired  = await otpService.acquireVerifyLock(lockKey, lockValue);
+  if (!acquired) {
+    throw new AppError(409, 'Verification already in progress. Please wait a moment and try again.');
+  }
 
-    // FIX: re-read updated attempt count from Redis, not MongoDB.
-    const updated = await otpService.getOtpRecord(normalised);
-    if (updated?.locked) {
+  try {
+    const valid = await otpService.verifyOtp(otp, record.otpHash);
+    if (!valid) {
+      await otpService.incrementAttempts(normalised);
+
+      // FIX: re-read updated attempt count from Redis, not MongoDB.
+      const updated = await otpService.getOtpRecord(normalised);
+      if (updated?.locked) {
+        throw new AppError(
+          400,
+          "Too many failed attempts — this session is now locked. Please register again.",
+          "OTP_LOCKED",
+        );
+      }
+
+      const remaining = updated
+        ? Math.max(0, OTP_MAX_ATTEMPTS - updated.attempts)
+        : 0;
       throw new AppError(
         400,
-        "Too many failed attempts — this session is now locked. Please register again.",
-        "OTP_LOCKED",
+        `Invalid OTP. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`,
+        "OTP_INVALID",
       );
     }
 
-    const remaining = updated
-      ? Math.max(0, OTP_MAX_ATTEMPTS - updated.attempts)
-      : 0;
-    throw new AppError(
-      400,
-      `Invalid OTP. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`,
-      "OTP_INVALID",
-    );
-  }
+    if (!record.passwordHash) {
+      throw new AppError(
+        500,
+        "Registration session corrupted — please register again",
+        "SESSION_CORRUPT",
+      );
+    }
 
-  if (!record.passwordHash) {
-    throw new AppError(
-      500,
-      "Registration session corrupted — please register again",
-      "SESSION_CORRUPT",
-    );
-  }
+    // FIX: delete from Redis (source of truth), not MongoDB.
+    await otpService.deleteOtpRecord(normalised);
 
-  // FIX: delete from Redis (source of truth), not MongoDB.
-  await otpService.deleteOtpRecord(normalised);
-
-  const user = await User.create({
-    email: normalised,
-    passwordHash: record.passwordHash,
-    role: "student",
-    profileCompleted: false,
-  });
+    const user = await User.create({
+      email: normalised,
+      passwordHash: record.passwordHash,
+      role: "student",
+      profileCompleted: false,
+    });
 
   await logAction({
     action: AUDIT_ACTIONS.USER_REGISTERED,
@@ -197,28 +219,39 @@ export const verifyOtp = asyncHandler(async (req: Request, res: Response) => {
     targetModel: "User",
   });
 
-  const accessToken = tokenService.signAccessToken(user._id.toString());
-  const refreshToken = tokenService.signRefreshToken(user._id.toString());
-  await tokenService.storeRefreshToken(user._id.toString(), refreshToken);
+    const accessToken = tokenService.signAccessToken(user._id.toString());
+    const refreshToken = tokenService.signRefreshToken(user._id.toString());
+    await tokenService.storeRefreshToken(user._id.toString(), refreshToken);
 
-  sendSuccess(
-    res,
-    {
-      accessToken,
-      refreshToken,
-      user: sanitizeUser(user),
-    },
-    "Email verified — account created",
-    201,
-  );
+    // Populate cache so the first authenticated request is a cache hit
+    await setCachedUser(user);
+
+    sendSuccess(
+      res,
+      {
+        accessToken,
+        refreshToken,
+        user: sanitizeUser(user),
+      },
+      "Email verified — account created",
+      201,
+    );
+  } finally {
+    // Release lock only if we still own it
+    await otpService.releaseVerifyLock(lockKey, lockValue);
+  }
 });
 
 export const login = asyncHandler(async (req: Request, res: Response) => {
   const { email, password } = req.body as z.infer<typeof loginSchema>;
   const normalised = email.toLowerCase();
 
-  const user = await User.findOne({ email: normalised });
-  if (!user) throw new AppError(401, "Invalid email or password");
+  const user = await User.findOne({ email: normalised }).select('+passwordHash').lean();
+  if (!user) {
+    // Constant-time dummy compare prevents email enumeration via timing
+    await bcrypt.compare(password, '$2b$10$timingsafetyplaceholderXXXXXXXXXXXXXXXXXXXXXXXXXX');
+    throw new AppError(401, "Invalid email or password");
+  }
   if (!user.isActive) throw new AppError(403, "Account deactivated");
   if (user.isSuspended) throw new AppError(403, "Account suspended");
 
@@ -229,6 +262,9 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
   const accessToken = tokenService.signAccessToken(user._id.toString());
   const refreshToken = tokenService.signRefreshToken(user._id.toString());
   await tokenService.storeRefreshToken(user._id.toString(), refreshToken);
+
+  // Populate cache so the first authenticated request after login is a cache hit
+  await setCachedUser(user);
 
   sendSuccess(
     res,
@@ -246,12 +282,19 @@ export const refresh = asyncHandler(async (req: Request, res: Response) => {
   if (!refreshToken) throw new AppError(400, "Refresh token required");
 
   const payload = await tokenService.verifyRefreshToken(refreshToken);
-  const user = await User.findById(payload.userId);
-  if (!user) throw new AppError(401, "User not found");
-  if (!user.isActive) throw new AppError(403, "Account deactivated");
+
+  // Cache-first — same pattern as authenticate middleware
+  let user: IUser | CachedUser | null = await getCachedUser(payload.userId);
+  if (!user) {
+    const dbUser = await User.findById(payload.userId).lean<IUser>();
+    if (!dbUser) throw new AppError(401, "User not found");
+    await setCachedUser(dbUser);
+    user = dbUser;
+  }
+
+  if (!user.isActive)   throw new AppError(403, "Account deactivated");
   if (user.isSuspended) throw new AppError(403, "Account suspended");
 
-  // Token rotation — revoke old, issue new
   await tokenService.revokeRefreshToken(refreshToken);
 
   const newRefreshToken = tokenService.signRefreshToken(user._id.toString());
@@ -259,11 +302,7 @@ export const refresh = asyncHandler(async (req: Request, res: Response) => {
 
   const accessToken = tokenService.signAccessToken(user._id.toString());
 
-  sendSuccess(
-    res,
-    { accessToken, refreshToken: newRefreshToken },
-    "Token refreshed",
-  );
+  sendSuccess(res, { accessToken, refreshToken: newRefreshToken }, "Token refreshed");
 });
 
 export const logout = asyncHandler(async (req: Request, res: Response) => {

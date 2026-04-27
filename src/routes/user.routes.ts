@@ -10,13 +10,14 @@ import {
   uploadAvatarHandler,
   changePassword,      passwordChangeSchema,
 } from '../controllers/user.controller';
+import { uploadLimiter } from '../middleware/rateLimiter';
 
 const router = Router();
 
 router.use(authenticate);
 
 router.get('/me',          getMe);
-router.post('/me/avatar',  uploadAvatar, uploadAvatarHandler);
+router.post('/me/avatar', uploadLimiter, uploadAvatar, uploadAvatarHandler);
 router.put('/me/password', validate(passwordChangeSchema), changePassword);
 
 router.put(   '/me/profile', authorize('student'), validate(profileSchema),       completeProfile);

@@ -1,9 +1,11 @@
 import "./config/cloudinary"; // initialise Cloudinary SDK at startup, before any request handler
+import mongoose from "mongoose";
 import morgan from "morgan";
 import express from "express";
 import helmet from "helmet";
 import cors from "cors";
 import { env } from "./config/env";
+import { redis } from "./config/redis";
 import { generalLimiter } from "./middleware/rateLimiter";
 import { errorHandler, notFound } from "./middleware/errorHandler";
 
@@ -14,6 +16,7 @@ import associationRoutes from "./routes/association.routes";
 import electionRoutes from "./routes/election.routes";
 import candidateRoutes from "./routes/candidate.routes";
 import emaildashboardRoutes from "./routes/Emaildashboard.routes";
+import webhookRoutes from "./routes/Webhook.routes";
 
 const app = express();
 
@@ -63,19 +66,18 @@ app.use(morgan(env.NODE_ENV === "production" ? "combined" : "dev"));
 app.use(generalLimiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => {
-  const mem = process.memoryUsage();
-  const mb = (bytes: number) => `${Math.round(bytes / 1024 / 1024)}MB`;
+app.get("/health", async (_req, res) => {
+  const dbOk    = mongoose.connection.readyState === 1; // 1 = connected
+  const redisOk = redis.isOpen;
+  const status  = dbOk && redisOk ? 'ok' : 'degraded';
 
-  res.status(200).json({
-    status: "ok",
-    memory: {
-      rss: mb(mem.rss), // total process memory (watch this one)
-      heapUsed: mb(mem.heapUsed), // JS objects in use
-      heapTotal: mb(mem.heapTotal), // V8 heap size
-      external: mb(mem.external), // C++ objects (Buffers, native addons)
-    },
-    uptime: `${Math.round(process.uptime())}s`,
+  return res.status(dbOk && redisOk ? 200 : 503).json({
+    status,
+    uptime:    process.uptime(),
+    memory:    process.memoryUsage(),
+    db:        dbOk    ? 'connected'    : 'disconnected',
+    redis:     redisOk ? 'connected'    : 'disconnected',
+    timestamp: new Date().toISOString(),
   });
 });
 
@@ -87,6 +89,7 @@ app.use("/api/associations", associationRoutes);
 app.use("/api/elections", electionRoutes);
 app.use("/api/offices", candidateRoutes);
 app.use("/api/email/dashboard", emaildashboardRoutes);
+app.use("/api/webhooks", webhookRoutes);
 
 // ── 404 + global error handler ────────────────────────────────────────────────
 app.use(notFound);

@@ -87,6 +87,7 @@ const X_VOTES = X_NAME + COL.name;
 
 export interface ProcessedOffice {
   positionTitle: string;
+  voteType: 'competitive' | 'confirmation';
   candidates: Array<{ fullName: string; voteCount: number }>;
   totalVotes: number;
   candidateCount: number;
@@ -97,24 +98,74 @@ export interface ProcessedOffice {
 export function processOffice(office: OfficeTally): ProcessedOffice {
   const positionTitle = office.officeTitle.toUpperCase();
   const raw = office.candidates ?? [];
-
   const candidates = [...raw].sort((a, b) => b.voteCount - a.voteCount);
   const totalVotes = candidates.reduce((s, c) => s + c.voteCount, 0);
   const candidateCount = candidates.length;
 
+  // ── Confirmation ballot (single candidate, approve/reject vote) ─────────────
+  if (office.voteType === 'confirmation') {
+    const candidateName = candidates[0]?.fullName?.toUpperCase() ?? 'CANDIDATE';
+    const approveCount  = office.approveCount ?? 0;
+    const rejectCount   = office.rejectCount  ?? 0;
+    const confirmTotal  = approveCount + rejectCount;
+
+    if (confirmTotal === 0) {
+      return {
+        positionTitle,
+        voteType: 'confirmation',
+        candidates,
+        totalVotes: confirmTotal,
+        candidateCount,
+        winnerText: 'No valid votes recorded',
+        winnerStatus: 'none',
+      };
+    }
+
+    // Tie — equal approve/reject
+    if (office.isTie || approveCount === rejectCount) {
+      return {
+        positionTitle,
+        voteType: 'confirmation',
+        candidates,
+        totalVotes: confirmTotal,
+        candidateCount,
+        winnerText: `TIE — ${candidateName} received equal approve and reject votes (${approveCount} each)`,
+        winnerStatus: 'tie',
+      };
+    }
+
+    // elected=true → approved; elected=false → rejected (more reject votes than approve)
+    const isElected = office.elected === true || approveCount > rejectCount;
+    const winnerText = isElected
+      ? `${candidateName} — ELECTED (${fmtVotes(approveCount)} approve vs ${fmtVotes(rejectCount)} reject)`
+      : `${candidateName} — NOT ELECTED (${fmtVotes(rejectCount)} reject vs ${fmtVotes(approveCount)} approve)`;
+
+    return {
+      positionTitle,
+      voteType: 'confirmation',
+      candidates,
+      totalVotes: confirmTotal,
+      candidateCount,
+      winnerText,
+      winnerStatus: isElected ? 'single' : 'none',
+    };
+  }
+
+  // ── Competitive ballot (multiple candidates, pick highest vote-getter) ───────
   if (candidateCount === 0 || totalVotes === 0) {
     return {
       positionTitle,
       candidates,
       totalVotes,
       candidateCount,
-      winnerText: "No valid votes recorded",
-      winnerStatus: "none",
+      winnerText: 'No valid votes recorded',
+      winnerStatus: 'none',
+      voteType: 'competitive',
     };
   }
 
   const maxVotes = candidates[0].voteCount;
-  const topTied = candidates.filter((c) => c.voteCount === maxVotes);
+  const topTied  = candidates.filter((c) => c.voteCount === maxVotes);
   const voteLabel = fmtVotes(maxVotes);
 
   if (topTied.length === 1) {
@@ -124,18 +175,20 @@ export function processOffice(office: OfficeTally): ProcessedOffice {
       totalVotes,
       candidateCount,
       winnerText: `${topTied[0].fullName.toUpperCase()} — ${voteLabel}`,
-      winnerStatus: "single",
+      winnerStatus: 'single',
+      voteType: 'competitive',
     };
   }
 
-  const names = topTied.map((c) => c.fullName.toUpperCase()).join(" & ");
+  const names = topTied.map((c) => c.fullName.toUpperCase()).join(' & ');
   return {
     positionTitle,
+    voteType: 'competitive',
     candidates,
     totalVotes,
     candidateCount,
     winnerText: `TIE — ${names}, ${voteLabel} each`,
-    winnerStatus: "tie",
+    winnerStatus: 'tie',
   };
 }
 
@@ -196,7 +249,7 @@ export function generateCsv(election: IElection, tally: OfficeTally[]): string {
     ["Published At", election.updatedAt.toISOString()],
     ["Exported At", new Date().toISOString()],
     [],
-    ["Office", "Type", "Candidates", "Total Votes", "Winner"],
+    ["Office", "Type", "Candidates", "Total Votes", "Winner / Outcome"],
   ];
 
   for (const office of tally) {
@@ -422,17 +475,18 @@ function renderPositionBlock(doc: Doc, p: ProcessedOffice): void {
   // ── 2. Winner row — all bold, dark ─────────────────────────────────────────
   const winnerY = doc.y;
 
+  const outcomeLabel = p.voteType === 'confirmation' ? 'Outcome:' : 'Winner:';
   doc
     .font("Helvetica-Bold")
     .fontSize(DS.type.winnerLabel)
     .fillColor(DS.color.dark)       // ← was muted, now dark
-    .text("Winner:", X, winnerY, { width: 48, lineBreak: false });
+    .text(outcomeLabel, X, winnerY, { width: 60, lineBreak: false });
 
   doc
     .font("Helvetica-Bold")
     .fontSize(DS.type.winnerName)
     .fillColor(DS.color.dark)
-    .text(p.winnerText, X + 52, winnerY, { width: CW - 52, lineBreak: false });
+    .text(p.winnerText, X + 64, winnerY, { width: CW - 64, lineBreak: false });
 
   doc.y = winnerY + DS.type.winnerName + SP.s4;
 

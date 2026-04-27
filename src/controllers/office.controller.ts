@@ -65,18 +65,32 @@ export const createOffice = asyncHandler(
 );
 
 export const listOffices = asyncHandler(async (req: Request, res: Response) => {
-  const offices = await Office.find({ electionId: req.params.id });
-  const withCandidates = await Promise.all(
-    offices.map(async (o) => {
-      const candidates = await Candidate.find({ officeId: o._id });
-      return {
-        ...o.toObject(),
-        candidates,
-        candidateCount: candidates.length,
-      };
-    }),
-  );
-  sendSuccess(res, withCandidates);
+  const { id: electionId } = req.params;
+
+  const offices = await Office.find({ electionId }).lean();
+
+  if (offices.length === 0) return sendSuccess(res, [], 'No offices found');
+
+  // Single batched query instead of N parallel queries
+  const allCandidates = await Candidate.find(
+    { officeId: { $in: offices.map(o => o._id) } }
+  ).lean();
+
+  // Group candidates by officeId
+  const byOffice = new Map<string, typeof allCandidates>();
+  for (const candidate of allCandidates) {
+    const key = candidate.officeId.toString();
+    if (!byOffice.has(key)) byOffice.set(key, []);
+    byOffice.get(key)!.push(candidate);
+  }
+
+  const withCandidates = offices.map(office => ({
+    ...office,
+    candidates: byOffice.get(office._id.toString()) ?? [],
+    candidateCount: (byOffice.get(office._id.toString()) ?? []).length,
+  }));
+
+  return sendSuccess(res, withCandidates, 'Offices retrieved');
 });
 
 export const updateOffice = asyncHandler(
@@ -125,11 +139,11 @@ export const deleteOffice = asyncHandler(
 
     // Remove each candidate's Cloudinary photo, then the candidate documents
     const candidates = await Candidate.find({ officeId: office._id });
-    for (const c of candidates) {
-      if (c.photoPublicId) {
-        await deleteImage(c.photoPublicId).catch(() => null); // best-effort
-      }
-    }
+    await Promise.all(
+      candidates
+        .filter(c => c.photoPublicId)
+        .map(c => deleteImage(c.photoPublicId!).catch(() => null))
+    );
     await Candidate.deleteMany({ officeId: office._id });
     await Office.findByIdAndDelete(office._id);
 

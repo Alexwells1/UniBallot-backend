@@ -4,11 +4,8 @@ import { EmailLog } from "../../models/Emaillog";
 import { SuppressedAddress } from "../../models/Suppressedaddress";
 import { EmailJobData, emailRetryQueue } from "./Emailqueue.service";
 import { sendViaResend } from "./Resend.provider";
-import { sendViaBrevo } from "./Brevoprovider";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-
-
 
 export interface ProviderSendOptions {
   to:      string;
@@ -34,7 +31,6 @@ interface Provider {
 
 const providers: Provider[] = [
   { name: "resend", fn: sendViaResend },
-  { name: "brevo", fn: sendViaBrevo },
 ];
 
 // ─── Core send logic ──────────────────────────────────────────────────────────
@@ -83,14 +79,14 @@ async function processEmailJob(job: Job<EmailJobData>): Promise<void> {
     console.log(`[worker] Address not suppressed, continuing | jobId=${jobId}`);
 
     // 2. Fetch and increment attempt count
-    const log = await EmailLog.findOne({ jobId });
+    const freshLog = await EmailLog.findOne({ jobId });
 
-    if (!log) {
+    if (!freshLog) {
       console.error(`[worker] ❌ No EmailLog found for jobId=${jobId}`);
       throw new Error(`EmailLog not found for jobId=${jobId}`);
     }
 
-    const currentAttempts = (log.attempts ?? 0) + 1;
+    const currentAttempts = (freshLog.attempts ?? 0) + 1;
     console.log(
       `[worker] Attempt ${currentAttempts}/${MAX_ATTEMPTS} | jobId=${jobId}`,
     );
@@ -125,10 +121,8 @@ async function processEmailJob(job: Job<EmailJobData>): Promise<void> {
         lastError = `${provider.name}: ${err.message}`;
 
         if (!err.isPermanent) {
-          // At least one provider had a temporary failure — don't mark all-permanent
           allPermanent = false;
         }
-        // Always continue to the next provider
       }
     }
 

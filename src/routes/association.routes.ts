@@ -6,7 +6,7 @@ import {
   createAssociation, associationSchema,
   listAssociations,
   getAssociation,
-  updateAssociation,
+  updateAssociation, updateAssociationSchema,
   deleteAssociation,
 } from '../controllers/association.controller';
 
@@ -17,7 +17,7 @@ router.use(authenticate, authorize('super_admin'));
 router.post('/',    validate(associationSchema), createAssociation);
 router.get('/',     listAssociations);
 router.get('/:id',  getAssociation);
-router.patch('/:id', updateAssociation);
+router.patch('/:id', validate(updateAssociationSchema), updateAssociation);
 router.delete('/:id', deleteAssociation);
 
 export default router;

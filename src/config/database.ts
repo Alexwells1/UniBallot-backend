@@ -2,15 +2,14 @@ import mongoose from 'mongoose';
 import { env } from './env';
 
 /**
- * Connects to MongoDB Atlas with a connection pool tuned for 6,000 concurrent users.
- * Atlas M10 supports up to 1,500 connections; this instance reserves 300 per node
- * to allow horizontal scaling across multiple backend replicas.
+ * Connects to MongoDB Atlas with a connection pool tuned for a single Render free-tier instance.
+ * 512MB RAM, 1 shared CPU — 10 connections is plenty when combined with p-limit and Redis caching.
  */
 export async function connectDatabase(): Promise<void> {
   try {
     await mongoose.connect(env.MONGO_URI, {
-      maxPoolSize:              300,
-      minPoolSize:              10,
+      maxPoolSize:              10,   // single free-tier node — 10 is plenty
+      minPoolSize:              2,
       waitQueueTimeoutMS:       10_000,
       serverSelectionTimeoutMS: 5_000,
       socketTimeoutMS:          45_000,
