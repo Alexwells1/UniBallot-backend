@@ -1,7 +1,7 @@
-import mongoose, { Document, Schema, Types } from 'mongoose';
+import mongoose, { Document, Schema, Types } from "mongoose";
 
-export type UserRole = 'super_admin' | 'officer' | 'student';
-export type UserGender = 'male' | 'female' | 'other';
+export type UserRole = "super_admin" | "officer" | "student";
+export type UserGender = "male" | "female" | "other";
 
 export interface IUser extends Document {
   _id: Types.ObjectId;
@@ -12,6 +12,7 @@ export interface IUser extends Document {
   matricNumber?: string;
   gender?: UserGender;
   avatarPath?: string;
+  avatarLocked: boolean;
   profileCompleted: boolean;
   isActive: boolean;
   isSuspended: boolean;
@@ -22,19 +23,30 @@ export interface IUser extends Document {
 
 const userSchema = new Schema<IUser>(
   {
-    email:              { type: String, required: true, unique: true, lowercase: true, trim: true },
-    passwordHash:       { type: String, required: true },
-    role:               { type: String, enum: ['super_admin', 'officer', 'student'], required: true },
-    fullName:           { type: String, trim: true },
-    matricNumber:       { type: String, sparse: true, unique: true },
-    gender:             { type: String, enum: ['male', 'female', 'other'] },
-    avatarPath:         { type: String },
-    profileCompleted:   { type: Boolean, default: false },
-    isActive:           { type: Boolean, default: true },
-    isSuspended:        { type: Boolean, default: false },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+    },
+    passwordHash: { type: String, required: true },
+    role: {
+      type: String,
+      enum: ["super_admin", "officer", "student"],
+      required: true,
+    },
+    fullName: { type: String, trim: true },
+    matricNumber: { type: String, sparse: true, unique: true },
+    gender: { type: String, enum: ["male", "female", "other"] },
+    avatarPath: { type: String },
+    avatarLocked: { type: Boolean, default: false },
+    profileCompleted: { type: Boolean, default: false },
+    isActive: { type: Boolean, default: true },
+    isSuspended: { type: Boolean, default: false },
     mustChangePassword: { type: Boolean, default: false },
   },
-  { timestamps: true }
+  { timestamps: true },
 );
 
-export default mongoose.model<IUser>('User', userSchema);
+export default mongoose.model<IUser>("User", userSchema);

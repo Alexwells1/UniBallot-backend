@@ -30,11 +30,6 @@ function computeVoteHash(
     .digest('hex');
 }
 
-// ── Ballot data cache ─────────────────────────────────────────────────────────
-// Election, offices, and candidates are read-only during voting_open.
-// Caching them eliminates 3 sequential DB reads on every vote submission,
-// cutting pre-flight latency from ~150ms to ~1ms on cache hit.
-
 interface BallotData {
   election:   { _id: string; status: string; isLocked: boolean };
   offices:    Array<{ _id: string; title: string; description?: string }>;
@@ -74,8 +69,6 @@ async function getBallotData(electionId: string): Promise<BallotData> {
     })),
   };
 
-  // Cache for 5 minutes — safe because offices and candidates are locked
-  // before voting_open status is set (candidatesLocked + membersLocked = true).
   await redis.setEx(cacheKey, 300, JSON.stringify(data)).catch(() => null);
   return data;
 }
@@ -103,7 +96,6 @@ async function isVoterRegistered(
     ? { registered: true,  hasVoted: voter.hasVoted }
     : { registered: false, hasVoted: false };
 
-  // Only cache if registered — unregistered users shouldn't get a stale negative cache
   if (result.registered) {
     await redis.setEx(key, VOTER_CACHE_TTL, JSON.stringify(result)).catch(() => null);
   }
@@ -152,11 +144,6 @@ export async function getBallot(electionId: string, userId: string) {
   };
 }
 
-// ── Submit Ballot (public wrapper — enforces p-limit concurrency cap) ─────────
-// voteLimit queues calls beyond the configured concurrency instead of
-// hammering MongoDB with concurrent transactions.
-// The concurrencyLimit middleware in front of the route handler is the hard
-// shed layer (503); this is the soft DB protection layer (queuing).
 
 export function submitBallot(
   electionId: string,
@@ -174,21 +161,11 @@ async function _submitBallot(
   votes:      VoteSubmission[]
 ): Promise<{ receiptCode: string }> {
 
-  // Step 1: Fast-path early exit — checks Redis voter cache.
-  // THIS IS NOT THE AUTHORITATIVE DOUBLE-VOTE GUARD.
-  // Two concurrent requests can both pass this check if the cache
-  // hasn't been updated yet. The authoritative guard is Step 7:
-  // findOneAndUpdate({ hasVoted: false }) which is atomic at the MongoDB
-  // document level. This check exists only to save DB and p-limit resources
-  // for the common case (voter loads ballot, votes, done).
   const voterCheck = await isVoterRegistered(electionId, userId);
 
   if (!voterCheck.registered) throw new AppError(403, 'You are not registered for this election');
   if (voterCheck.hasVoted) throw new AppError(409, 'You have already voted');
 
-  // ── Step 2: Load election + offices + candidates from Redis cache ─────────
-  // Cache hit = ~1ms. Cache miss = ~150ms (3 DB reads). Safe to cache because
-  // candidatesLocked and membersLocked are set true before voting_open.
   const { election, offices, candidates } = await getBallotData(electionId);
 
   if (election.status !== 'voting_open') throw new AppError(400, 'Voting is not open');
@@ -259,10 +236,6 @@ async function _submitBallot(
     };
   });
 
-  // ── Step 6: Insert vote documents FIRST — if this fails, voter can retry ──
-  // (hasVoted still false). The unique index on (electionId, officeId, ballotToken)
-  // makes this idempotent — a retry after a crash will produce duplicate key errors
-  // which we treat as a safe no-op / 409.
   try {
     await Vote.insertMany(voteDocs, { ordered: false });
   } catch (err) {
@@ -278,10 +251,7 @@ async function _submitBallot(
     throw err;
   }
 
-  // ── Step 7: Mark voter as having voted — this is the point of no return ──
-  // findOneAndUpdate is atomic at the document level. A session wrapping this
-  // single-document update adds oplog coordination overhead (~6–8s on Atlas
-  // free tier) with no correctness benefit.
+
   const votedVoter = await RegisteredVoter.findOneAndUpdate(
     { electionId, userId, hasVoted: false },
     { $set: { hasVoted: true, ballotToken, receiptCode, votedAt: submittedAt } },
@@ -289,8 +259,6 @@ async function _submitBallot(
   );
 
   if (!votedVoter) {
-    // Vote documents were inserted but voter was already marked — duplicate vote
-    // The unique index on Vote prevented double-insertion; safe to reject
     throw new AppError(409, 'You have already voted in this election');
   }
 

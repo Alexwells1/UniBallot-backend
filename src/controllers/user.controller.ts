@@ -7,7 +7,7 @@ import { AppError } from '../utils/AppError';
 import { asyncHandler } from '../utils/asyncHandler';
 import { sendSuccess } from '../utils/apiResponse';
 import { sanitizeUser } from '../utils/sanitize';
-import { uploadImage, deleteImage } from '../services/upload.service';
+import { uploadAvatar, deleteImage } from '../services/upload.service'; // ← typed upload
 import { logAction } from '../services/audit.service';
 import { AUDIT_ACTIONS, CLOUDINARY_FOLDERS, MATRIC_NUMBER_REGEX } from '../config/constants';
 
@@ -17,10 +17,6 @@ export const profileSchema = z.object({
   gender:       z.enum(['male', 'female', 'other']).optional(),
 });
 
-/**
- * Schema for subsequent profile updates (PATCH).
- * matricNumber is intentionally excluded — it is immutable after first completion.
- */
 export const updateProfileSchema = z.object({
   fullName: z.string().min(2, 'Full name must be at least 2 characters').optional(),
   gender:   z.enum(['male', 'female', 'other']).optional(),
@@ -35,11 +31,7 @@ export const getMe = asyncHandler(async (req: Request, res: Response) => {
   sendSuccess(res, sanitizeUser(req.user), 'Profile retrieved');
 });
 
-/**
- * First-time profile completion (PUT).
- * Sets matricNumber and marks profileCompleted = true.
- * Subsequent edits must use PATCH /me/profile (updateProfile).
- */
+
 export const completeProfile = asyncHandler(async (req: Request, res: Response) => {
   if (req.user.profileCompleted) throw new AppError(409, 'Profile already completed');
 
@@ -51,7 +43,7 @@ export const completeProfile = asyncHandler(async (req: Request, res: Response) 
   const updated = await User.findByIdAndUpdate(
     req.user._id,
     { $set: updateFields },
-    { new: true, runValidators: true }
+    { new: true, runValidators: true },
   );
   if (!updated) throw new AppError(404, 'User not found');
 
@@ -65,16 +57,13 @@ export const completeProfile = asyncHandler(async (req: Request, res: Response) 
   sendSuccess(res, sanitizeUser(updated), 'Profile completed successfully');
 });
 
-/**
- * Updates fullName and/or gender for users who have already completed their profile.
- * matricNumber is read-only after initial completion and is silently ignored.
- */
+
 export const updateProfile = asyncHandler(async (req: Request, res: Response) => {
   const { fullName, gender } = req.body as z.infer<typeof updateProfileSchema>;
 
   const fields: Record<string, unknown> = {};
   if (fullName !== undefined) fields.fullName = fullName;
-  if (gender !== undefined)   fields.gender   = gender;
+  if (gender   !== undefined) fields.gender   = gender;
 
   if (Object.keys(fields).length === 0) {
     throw new AppError(400, 'No updatable fields provided');
@@ -83,15 +72,21 @@ export const updateProfile = asyncHandler(async (req: Request, res: Response) =>
   const updated = await User.findByIdAndUpdate(
     req.user._id,
     { $set: fields },
-    { new: true, runValidators: true }
+    { new: true, runValidators: true },
   );
   if (!updated) throw new AppError(404, 'User not found');
 
   sendSuccess(res, sanitizeUser(updated), 'Profile updated');
 });
 
+// controllers/user.controller.ts
 export const uploadAvatarHandler = asyncHandler(async (req: Request, res: Response) => {
   if (!req.file) throw new AppError(400, 'No image file provided (form field name: "avatar")');
+
+  // ← Reject if avatar was already set once
+  if (req.user.avatarLocked) {
+    throw new AppError(403, 'Avatar can only be changed once. Your avatar is now locked.');
+  }
 
   const existing = await Avatar.findOne({ userId: req.user._id });
   if (existing) {
@@ -99,14 +94,21 @@ export const uploadAvatarHandler = asyncHandler(async (req: Request, res: Respon
     await Avatar.deleteOne({ userId: req.user._id });
   }
 
-  const { url, publicId } = await uploadImage(
+  const { url, publicId } = await uploadAvatar(
     req.file.buffer,
     CLOUDINARY_FOLDERS.AVATARS,
-    req.user._id.toString()
+    req.user._id.toString(),
   );
 
   await Avatar.create({ userId: req.user._id, url, publicId });
-  await User.findByIdAndUpdate(req.user._id, { $set: { avatarPath: url } });
+
+  // ← Lock the avatar and save the path together
+  await User.findByIdAndUpdate(req.user._id, {
+    $set: {
+      avatarPath: url,
+      avatarLocked: true, // ← locked permanently after this upload
+    },
+  });
 
   sendSuccess(res, { avatarUrl: url }, 'Avatar uploaded successfully');
 });
