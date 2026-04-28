@@ -78,13 +78,18 @@ export const updateProfile = asyncHandler(async (req: Request, res: Response) =>
 
   sendSuccess(res, sanitizeUser(updated), 'Profile updated');
 });
+import { invalidateCachedUser } from '../services/userCache.service'; // ← add this import
 
-// controllers/user.controller.ts
 export const uploadAvatarHandler = asyncHandler(async (req: Request, res: Response) => {
   if (!req.file) throw new AppError(400, 'No image file provided (form field name: "avatar")');
 
-  // ← Reject if avatar was already set once
-  if (req.user.avatarLocked) {
+  const userToLock = await User.findOneAndUpdate(
+    { _id: req.user._id, avatarLocked: { $ne: true } },
+    { $set: { avatarLocked: true } },
+    { new: false },
+  );
+
+  if (!userToLock) {
     throw new AppError(403, 'Avatar can only be changed once. Your avatar is now locked.');
   }
 
@@ -102,13 +107,9 @@ export const uploadAvatarHandler = asyncHandler(async (req: Request, res: Respon
 
   await Avatar.create({ userId: req.user._id, url, publicId });
 
-  // ← Lock the avatar and save the path together
-  await User.findByIdAndUpdate(req.user._id, {
-    $set: {
-      avatarPath: url,
-      avatarLocked: true, // ← locked permanently after this upload
-    },
-  });
+  await User.findByIdAndUpdate(req.user._id, { $set: { avatarPath: url } });
+
+  await invalidateCachedUser(req.user._id.toString());
 
   sendSuccess(res, { avatarUrl: url }, 'Avatar uploaded successfully');
 });

@@ -22,36 +22,51 @@ export const uploadMembers = asyncHandler(
     if (election.membersLocked)
       throw new AppError(409, "Member list is locked");
     if (!req.file)
-      throw new AppError(400, 'No CSV file provided (form field name: "file")');
+      throw new AppError(400, 'No file provided (form field name: "file")');
 
     const report = await processMembersCsv(
       req.file.buffer,
       election._id.toString(),
+      req.file.originalname,
     );
 
     await logAction({
-      action: AUDIT_ACTIONS.MEMBERS_UPLOADED,
+      action:      AUDIT_ACTIONS.MEMBERS_UPLOADED,
       performedBy: req.user._id,
-      targetId: election._id,
+      targetId:    election._id,
       targetModel: "Election",
-      metadata: { inserted: report.inserted, invalid: report.invalid },
+      metadata:    { inserted: report.inserted, invalid: report.invalid },
     });
 
-    sendSuccess(res, report, "CSV processed");
+    sendSuccess(res, report, "File processed");
+  },
+);
+
+// ─── Count ─────────────────────────────────────────────────────────────────────
+
+export const getMemberCount = asyncHandler(
+  async (req: Request, res: Response) => {
+    const election = await Election.findById(req.params.id);
+    if (!election) throw new AppError(404, "Election not found");
+
+    const total = await AssociationMember.countDocuments({
+      electionId: req.params.id,
+    });
+
+    sendSuccess(res, { total });
   },
 );
 
 // ─── List ──────────────────────────────────────────────────────────────────────
 
 export const listMembers = asyncHandler(async (req: Request, res: Response) => {
-  // H-05: Implement cursor-based pagination
   const limitNum = Math.min(
     200,
     Math.max(1, parseInt((req.query.limit as string) || "50", 10)),
   );
   const cursor = req.query.cursor as string | undefined;
-
   const search = ((req.query.search as string) || "").trim();
+
   const filter: Record<string, unknown> = { electionId: req.params.id };
 
   if (cursor && mongoose.Types.ObjectId.isValid(cursor)) {
@@ -59,7 +74,6 @@ export const listMembers = asyncHandler(async (req: Request, res: Response) => {
   }
 
   if (search) {
-    // H-11: Anchored regex for search filtering
     const escaped = search.slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     filter.matricNumber = { $regex: "^" + escaped, $options: "i" };
   }
@@ -68,8 +82,8 @@ export const listMembers = asyncHandler(async (req: Request, res: Response) => {
     .limit(limitNum + 1)
     .sort({ _id: 1 });
 
-  const hasMore = members.length > limitNum;
-  const data = hasMore ? members.slice(0, limitNum) : members;
+  const hasMore    = members.length > limitNum;
+  const data       = hasMore ? members.slice(0, limitNum) : members;
   const nextCursor = hasMore ? data[data.length - 1]._id.toString() : null;
 
   sendSuccess(res, { data, nextCursor, hasMore });
@@ -79,7 +93,7 @@ export const listMembers = asyncHandler(async (req: Request, res: Response) => {
 
 export const getMember = asyncHandler(async (req: Request, res: Response) => {
   const member = await AssociationMember.findOne({
-    _id: req.params.memberId,
+    _id:        req.params.memberId,
     electionId: req.params.id,
   });
   if (!member) throw new AppError(404, "Member not found");
@@ -109,31 +123,27 @@ export const updateMember = asyncHandler(
 
     const { matricNumber } = parsed.data;
 
-    // Check uniqueness within the same election
     const conflict = await AssociationMember.findOne({
-      electionId: req.params.id,
+      electionId:   req.params.id,
       matricNumber: matricNumber.trim(),
-      _id: { $ne: req.params.memberId },
+      _id:          { $ne: req.params.memberId },
     });
     if (conflict)
       throw new AppError(409, "Matric number already exists in this election");
 
-    const update: Record<string, string> = {};
-    update.matricNumber = matricNumber.trim();
-
     const member = await AssociationMember.findOneAndUpdate(
       { _id: req.params.memberId, electionId: req.params.id },
-      { $set: update },
+      { $set: { matricNumber: matricNumber.trim() } },
       { new: true },
     );
     if (!member) throw new AppError(404, "Member not found");
 
     await logAction({
-      action: AUDIT_ACTIONS.MEMBER_UPDATED,
+      action:      AUDIT_ACTIONS.MEMBER_UPDATED,
       performedBy: req.user._id,
-      targetId: member._id,
+      targetId:    member._id,
       targetModel: "AssociationMember",
-      metadata: update,
+      metadata:    { matricNumber: matricNumber.trim() },
     });
 
     sendSuccess(res, member, "Member updated");
@@ -152,17 +162,17 @@ export const deleteMember = asyncHandler(
       throw new AppError(409, "Member list is locked");
 
     const member = await AssociationMember.findOneAndDelete({
-      _id: req.params.memberId,
+      _id:        req.params.memberId,
       electionId: req.params.id,
     });
     if (!member) throw new AppError(404, "Member not found");
 
     await logAction({
-      action: AUDIT_ACTIONS.MEMBER_DELETED,
+      action:      AUDIT_ACTIONS.MEMBER_DELETED,
       performedBy: req.user._id,
-      targetId: member._id,
+      targetId:    member._id,
       targetModel: "AssociationMember",
-      metadata: { matricNumber: member.matricNumber },
+      metadata:    { matricNumber: member.matricNumber },
     });
 
     sendSuccess(res, null, "Member deleted");
@@ -180,7 +190,6 @@ export const clearMembers = asyncHandler(
     if (election.membersLocked)
       throw new AppError(409, "Member list is locked");
 
-    // H-06: Before clearing members, check for registered voters
     const registeredVoterCount = await RegisteredVoter.countDocuments({
       electionId: election._id,
     });
@@ -194,9 +203,9 @@ export const clearMembers = asyncHandler(
     await AssociationMember.deleteMany({ electionId: election._id });
 
     await logAction({
-      action: AUDIT_ACTIONS.MEMBERS_CLEARED,
+      action:      AUDIT_ACTIONS.MEMBERS_CLEARED,
       performedBy: req.user._id,
-      targetId: election._id,
+      targetId:    election._id,
       targetModel: "Election",
     });
 

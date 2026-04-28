@@ -42,6 +42,7 @@ import {
   getMember,
   updateMember,
   deleteMember,
+  getMemberCount,
 } from "../controllers/member.controller";
 
 import {
@@ -147,13 +148,23 @@ router.post(
   uploadCsv,
   uploadMembers,
 );
+
 router.get("/:id/members", authenticate, authorizeElection, listMembers);
+
 router.delete(
   "/:id/members",
   authenticate,
   authorize("super_admin"),
   clearMembers,
 );
+
+router.get(
+  "/:id/members/count",
+  authenticate,
+  authorizeElection,
+  getMemberCount,
+);
+
 router.get(
   "/:id/members/:memberId",
   authenticate,

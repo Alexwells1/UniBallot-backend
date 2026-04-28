@@ -9,11 +9,11 @@ import type { OfficeTally } from "./results.service";
 
 const DS = {
   page: {
-    width: 595.28, // A4
+    width: 595.28,
     height: 841.89,
-    mH: 48, // horizontal margin
-    mT: 44, // top margin
-    mB: 44, // bottom margin
+    mH: 48,
+    mT: 44, 
+    mB: 44, 
   },
 
   sp: {

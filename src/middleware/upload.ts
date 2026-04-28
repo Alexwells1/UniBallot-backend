@@ -36,21 +36,31 @@ export const uploadPhoto = multer({
   fileFilter: imageFilter,
 }).single('photo');
 
-/** Membership CSV — form field name: "file" */
+/** Membership CSV/spreadsheet — form field name: "file" */
 export const uploadCsv = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: CSV_SIZE_LIMIT },
   fileFilter(_req, file, cb) {
-    const allowed = [
+    const allowedMimes = [
       'text/csv',
-      'application/vnd.ms-excel',
       'text/plain',
       'application/octet-stream',
+      'application/vnd.ms-excel',                                          // .xls
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
+      'application/vnd.oasis.opendocument.spreadsheet',                    // .ods
     ];
-    if (!allowed.includes(file.mimetype)) {
-      cb(new AppError(400, 'Only CSV files are allowed'));
+
+    const ext = file.originalname.split('.').pop()?.toLowerCase();
+    const allowedExts = ['csv', 'xlsx', 'xls', 'ods'];
+
+    const mimeOk = allowedMimes.includes(file.mimetype);
+    const extOk  = allowedExts.includes(ext ?? '');
+
+    if (!mimeOk && !extOk) {
+      cb(new AppError(400, 'Only CSV, XLSX, XLS, and ODS files are allowed'));
       return;
     }
+
     cb(null, true);
   },
 }).single('file');
