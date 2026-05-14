@@ -153,7 +153,7 @@ export const getOpenElections = asyncHandler(
     if (cached) return sendSuccess(res, JSON.parse(cached), 'Open elections retrieved');
 
     const elections = await Election.find({
-      status: "registration_open",
+      status: { $in: ["registration_open", "voting_open"] },
       isLocked: false,
     })
       .populate<{ associationId: { name: string } }>("associationId", "name")
@@ -415,8 +415,8 @@ export const registerForElection = asyncHandler(
       electionCode: electionCode.toUpperCase(),
     });
     if (!election) throw new AppError(404, "Election not found");
-    if (election.status !== "registration_open")
-      throw new AppError(400, "Registration is not open for this election");
+   if (!["registration_open", "registration_closed" ,"voting_open"].includes(election.status))
+  throw new AppError(400, "Registration is not open for this election");
     if (election.isLocked) throw new AppError(423, "Election is in lockdown");
 
     const eligible = await AssociationMember.findOne({
