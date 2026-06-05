@@ -57,40 +57,60 @@ export const register = asyncHandler(async (req: Request, res: Response) => {
   const { email, password } = req.body as z.infer<typeof registerSchema>;
   const normalised = email.toLowerCase();
 
-  // Step 1: Check both in parallel — DB user existence + Redis OTP status
-  const [existing, otpStatus] = await Promise.all([
-    User.findOne({ email: normalised }),
-    otpService.getOtpStatus(normalised),
-  ]);
-
+  // ── OTP_SKIP MODE ──────────────────────────────────────────────────────────
+  // OTP email verification is temporarily disabled to stay within Resend's
+  // free-tier limit (100 emails/day). Accounts are created immediately.
+  // To re-enable OTP: remove this block and uncomment the OTP block below.
+  const existing = await User.findOne({ email: normalised });
   if (existing) throw new AppError(409, 'An account with this email already exists');
 
-  // Step 2: Bail early BEFORE hashing if a valid OTP session already exists
-  if (otpStatus.exists && !otpStatus.expired && !otpStatus.locked) {
-    throw new AppError(
-      409,
-      'A verification code was already sent to this email. Use the resend option if you need a new one.',
-      'OTP_ALREADY_SENT',
-    );
-  }
-
-  // Step 3: Only hash when we know we'll use it
   const passwordHash = await bcrypt.hash(password, 10);
 
-  const result = await otpService.createOtpRecord(normalised, passwordHash);
+  const user = await User.create({
+    email: normalised,
+    passwordHash,
+    role: 'student',
+    profileCompleted: false,
+  });
 
-  if (result.reused) {
-    throw new AppError(
-      409,
-      'A verification code was already sent to this email. Use the resend option if you need a new one.',
-      'OTP_ALREADY_SENT',
-    );
-  }
+  await logAction({
+    action: AUDIT_ACTIONS.USER_REGISTERED,
+    performedBy: user._id,
+    targetId: user._id,
+    targetModel: 'User',
+  });
 
-  const template = emailService.otpEmailTemplate(result.otp);
-  await emailService.sendEmail({ to: normalised, ...template });
+  const accessToken  = tokenService.signAccessToken(user._id.toString());
+  const refreshToken = tokenService.signRefreshToken(user._id.toString());
+  await tokenService.storeRefreshToken(user._id.toString(), refreshToken);
+  await setCachedUser(user);
 
-  sendSuccess(res, null, 'Check your email for a verification code', 201);
+  return sendSuccess(
+    res,
+    { accessToken, refreshToken, user: sanitizeUser(user) },
+    'Account created successfully',
+    201,
+  );
+  // ── END OTP_SKIP MODE ──────────────────────────────────────────────────────
+
+  // ── OTP MODE (re-enable when Resend limit is lifted) ──────────────────────
+  // const [existingUser, otpStatusResult] = await Promise.all([
+  //   User.findOne({ email: normalised }),
+  //   otpService.getOtpStatus(normalised),
+  // ]);
+  // if (existingUser) throw new AppError(409, 'An account with this email already exists');
+  // if (otpStatusResult.exists && !otpStatusResult.expired && !otpStatusResult.locked) {
+  //   throw new AppError(409, 'A verification code was already sent to this email.', 'OTP_ALREADY_SENT');
+  // }
+  // const passwordHash = await bcrypt.hash(password, 10);
+  // const result = await otpService.createOtpRecord(normalised, passwordHash);
+  // if (result.reused) {
+  //   throw new AppError(409, 'A verification code was already sent to this email.', 'OTP_ALREADY_SENT');
+  // }
+  // const template = emailService.otpEmailTemplate(result.otp);
+  // await emailService.sendEmail({ to: normalised, ...template });
+  // return sendSuccess(res, null, 'Check your email for a verification code', 201);
+  // ── END OTP MODE ───────────────────────────────────────────────────────────
 });
 
 export const resendOtp = asyncHandler(async (req: Request, res: Response) => {
